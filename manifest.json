@@ -1,0 +1,68 @@
+{
+  "manifest_version": 2,
+  "name": "Exchange Calendar Sync",
+  "version": "2.0.0",
+  "description": "Syncs calendar data from Microsoft Exchange (EWS) to local Thunderbird calendars. Supports OAuth 2.0 and Basic Auth.",
+  "author": "Peter Schenkel",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "exchange-calendar-sync@pschenkel",
+      "strict_min_version": "128.0",
+      "strict_max_version": "150.*"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.svg",
+    "32": "icons/icon-32.svg",
+    "64": "icons/icon-64.svg"
+  },
+  "background": {
+    "scripts": [
+      "ews/xml-builder.js",
+      "ews/autodiscover.js",
+      "ews/client.js",
+      "sync/engine.js",
+      "sync/imip.js",
+      "background.js"
+    ]
+  },
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": true,
+    "browser_style": true
+  },
+  "permissions": [
+    "storage",
+    "alarms",
+    "messagesRead",
+    "accountsRead",
+    "notifications",
+    "messagesUpdate",
+    "<all_urls>"
+  ],
+  "experiment_apis": {
+    "CalendarAPI": {
+      "schema": "api/CalendarAPI/schema.json",
+      "parent": {
+        "scopes": ["addon_parent"],
+        "paths": [["CalendarAPI"]],
+        "script": "api/CalendarAPI/implementation.js"
+      }
+    }
+  },
+  "browser_action": {
+    "default_title": "Exchange Calendar Sync",
+    "default_icon": {
+      "16": "icons/icon-16.svg",
+      "32": "icons/icon-32.svg"
+    }
+  },
+  "message_display_action": {
+    "default_title": "Meeting Response",
+    "default_icon": {
+      "16": "icons/icon-16.svg",
+      "32": "icons/icon-32.svg"
+    },
+    "default_popup": "meetingbar/popup.html"
+  }
+}

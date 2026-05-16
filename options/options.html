@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Exchange Calendar Sync - Settings</title>
+  <style>
+    :root {
+      --bg: #f9f9fb; --card-bg: #ffffff; --text: #1a1a2e; --text-secondary: #5f6368;
+      --border: #dadce0; --primary: #0078D4; --primary-hover: #106EBE;
+      --success: #107C10; --error: #D13438; --warning: #FF8C00;
+      --input-bg: #ffffff; --input-border: #8a8a8a;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1e1e2e; --card-bg: #2a2a3e; --text: #e0e0e0; --text-secondary: #a0a0b0;
+        --border: #3a3a4e; --input-bg: #333348; --input-border: #555568;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg); color: var(--text); padding: 20px; max-width: 700px; margin: 0 auto;
+    }
+    h1 { font-size: 1.4em; margin-bottom: 4px; }
+    .subtitle { color: var(--text-secondary); font-size: 0.9em; margin-bottom: 20px; }
+    .card {
+      background: var(--card-bg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 16px; margin-bottom: 12px;
+    }
+    .card h2 { font-size: 1.05em; margin-bottom: 8px; }
+    label { display: block; font-size: 0.9em; font-weight: 500; margin-bottom: 4px; }
+    .hint { font-size: 0.8em; color: var(--text-secondary); margin-bottom: 8px; }
+    input[type="text"], input[type="email"], input[type="password"], input[type="number"] {
+      width: 100%; padding: 7px 10px; border: 1px solid var(--input-border); border-radius: 4px;
+      font-size: 0.95em; background: var(--input-bg); color: var(--text); margin-bottom: 10px;
+    }
+    input:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(0,120,212,0.2); }
+    button {
+      padding: 7px 16px; border: none; border-radius: 4px; font-size: 0.9em;
+      cursor: pointer; font-weight: 500; transition: background 0.15s;
+    }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-primary:disabled { background: #ccc; cursor: not-allowed; }
+    .btn-secondary { background: transparent; color: var(--primary); border: 1px solid var(--primary); }
+    .btn-secondary:hover { background: rgba(0,120,212,0.08); }
+    .btn-danger { background: var(--error); color: #fff; }
+    .btn-danger:hover { background: #b82e32; }
+    .btn-sm { padding: 5px 12px; font-size: 0.85em; }
+    .btn-ms {
+      background: #2f2f2f; color: #fff; display: inline-flex; align-items: center;
+      gap: 8px; padding: 8px 16px; font-size: 0.95em; border: none; cursor: pointer; border-radius: 4px;
+    }
+    .btn-ms:hover { background: #404040; }
+    .btn-ms:disabled { background: #888; cursor: not-allowed; }
+    .btn-ms .ms-logo {
+      width: 18px; height: 18px; display: inline-block;
+      background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 21 21'%3E%3Crect x='1' y='1' width='9' height='9' fill='%23f25022'/%3E%3Crect x='11' y='1' width='9' height='9' fill='%237fba00'/%3E%3Crect x='1' y='11' width='9' height='9' fill='%2300a4ef'/%3E%3Crect x='11' y='11' width='9' height='9' fill='%23ffb900'/%3E%3C/svg%3E") no-repeat center;
+      background-size: contain;
+    }
+    .btn-group { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+    .status-bar {
+      padding: 10px 14px; border-radius: 6px; font-size: 0.9em;
+      margin-bottom: 12px; display: none; white-space: pre-wrap;
+    }
+    .status-bar.visible { display: block; }
+    .status-bar.success { background: rgba(16,124,16,0.1); border: 1px solid var(--success); color: var(--success); }
+    .status-bar.error { background: rgba(209,52,56,0.1); border: 1px solid var(--error); color: var(--error); }
+    .status-bar.info { background: rgba(0,120,212,0.1); border: 1px solid var(--primary); color: var(--primary); }
+    .device-code-box {
+      display: none; background: var(--bg); border: 2px solid var(--primary);
+      border-radius: 8px; padding: 16px; margin: 12px 0; text-align: center;
+    }
+    .device-code-box.visible { display: block; }
+    .device-code-box .user-code {
+      font-size: 1.8em; font-weight: bold; font-family: Consolas, monospace;
+      letter-spacing: 3px; color: var(--primary); margin: 10px 0; user-select: all;
+    }
+    .device-code-box a { color: var(--primary); font-weight: 600; }
+    .account-card {
+      background: var(--card-bg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 14px; margin-bottom: 10px;
+    }
+    .account-card .email { font-weight: 600; font-size: 1em; }
+    .account-card .details { font-size: 0.85em; color: var(--text-secondary); margin: 4px 0; }
+    .account-card .status-badge {
+      display: inline-block; padding: 2px 8px; border-radius: 10px;
+      font-size: 0.8em; font-weight: 500;
+    }
+    .status-badge.connected { background: rgba(16,124,16,0.15); color: var(--success); }
+    .status-badge.disconnected { background: rgba(209,52,56,0.15); color: var(--error); }
+    .status-badge.error { background: rgba(255,140,0,0.15); color: var(--warning); }
+    .auth-toggle { margin-top: 10px; font-size: 0.85em; }
+    .auth-toggle a { color: var(--primary); cursor: pointer; text-decoration: underline; }
+    .basic-auth-section { display: none; margin-top: 10px; }
+    .basic-auth-section.visible { display: block; }
+    .divider {
+      display: flex; align-items: center; margin: 10px 0;
+      color: var(--text-secondary); font-size: 0.85em;
+    }
+    .divider::before, .divider::after { content: ''; flex: 1; border-bottom: 1px solid var(--border); }
+    .divider::before { margin-right: 10px; }
+    .divider::after { margin-left: 10px; }
+    #addAccountForm { display: none; }
+    #addAccountForm.visible { display: block; }
+    footer {
+      text-align: center; font-size: 0.8em; color: var(--text-secondary);
+      margin-top: 16px; padding-top: 10px; border-top: 1px solid var(--border);
+    }
+  </style>
+</head>
+<body>
+  <h1>&#128197; Exchange Calendar Sync</h1>
+  <p class="subtitle">Sync Exchange calendars to Thunderbird &mdash; multiple accounts supported</p>
+
+  <div id="statusBar" class="status-bar"></div>
+
+  <!-- Account list -->
+  <div id="accountList"></div>
+
+  <!-- Add account button -->
+  <div style="margin-bottom:12px">
+    <button id="btnShowAddAccount" class="btn-primary">+ Add Account</button>
+  </div>
+
+  <!-- Add account form -->
+  <div id="addAccountForm" class="card">
+    <h2>&#128274; Add Exchange Account</h2>
+
+    <label for="newEmail">Email Address</label>
+    <input type="email" id="newEmail" placeholder="user@company.com">
+
+    <button id="btnSignInMs" class="btn-ms" style="margin-top:2px">
+      <span class="ms-logo"></span> Sign in with Microsoft
+    </button>
+
+    <div id="deviceCodeBox" class="device-code-box">
+      <p>Open this URL in your browser:</p>
+      <p><a id="deviceCodeUrl" href="https://microsoft.com/devicelogin" target="_blank">https://microsoft.com/devicelogin</a></p>
+      <p style="margin-top:10px">Then enter this code:</p>
+      <div class="user-code" id="deviceCodeValue">--------</div>
+      <p style="font-size:0.85em;color:var(--text-secondary)" id="deviceCodeStatus">Waiting for sign-in...</p>
+    </div>
+
+    <div class="auth-toggle">
+      <a id="toggleBasicAuth">On-premise Exchange? Use password instead</a>
+    </div>
+
+    <div id="basicAuthSection" class="basic-auth-section">
+      <div class="divider">Basic Auth (on-premise)</div>
+      <label for="newUsername">Username</label>
+      <input type="text" id="newUsername" placeholder="DOMAIN\username">
+      <div class="hint">Leave empty to use email address.</div>
+      <label for="newPassword">Password</label>
+      <input type="password" id="newPassword" placeholder="Password">
+    </div>
+
+    <div style="margin-top:10px">
+      <label for="newCalName">Calendar Name</label>
+      <input type="text" id="newCalName" placeholder="Exchange Calendar">
+      <label for="newEwsUrl">EWS URL (optional)</label>
+      <input type="text" id="newEwsUrl" placeholder="Auto-discovered if empty">
+      <label for="newInterval">Sync interval (minutes)</label>
+      <input type="number" id="newInterval" value="5" min="1" max="60" style="max-width:100px">
+    </div>
+
+    <div class="btn-group">
+      <button id="btnAddAccount" class="btn-primary">Save &amp; Connect</button>
+      <button id="btnCancelAdd" class="btn-secondary">Cancel</button>
+    </div>
+  </div>
+
+  <!-- Pending Invitations -->
+  <div id="pendingInvitesSection" style="display:none">
+    <h2 style="font-size:1.05em;margin-bottom:8px">&#128233; Pending Meeting Invitations</h2>
+    <div id="pendingInvitesList"></div>
+  </div>
+
+  <footer>Exchange Calendar Sync v2.0.0 &mdash; EWS + OAuth + iMIP + Meeting Response</footer>
+  <script src="options.js"></script>
+</body>
+</html>

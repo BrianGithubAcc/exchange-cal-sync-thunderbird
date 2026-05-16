@@ -1,0 +1,196 @@
+[
+  {
+    "namespace": "CalendarAPI",
+    "description": "Experiment API for accessing Thunderbird's internal calendar manager. Provides CRUD operations for calendars and calendar items.",
+    "functions": [
+      {
+        "name": "getCalendars",
+        "type": "function",
+        "description": "Returns all registered calendars.",
+        "async": true,
+        "parameters": []
+      },
+      {
+        "name": "createCalendar",
+        "type": "function",
+        "description": "Creates a new local calendar (storage calendar).",
+        "async": true,
+        "parameters": [
+          {
+            "name": "name",
+            "type": "string",
+            "description": "Display name of the calendar."
+          },
+          {
+            "name": "color",
+            "type": "string",
+            "description": "CSS color for the calendar (e.g. '#0078D4')."
+          }
+        ]
+      },
+      {
+        "name": "removeCalendar",
+        "type": "function",
+        "description": "Removes a calendar by its ID.",
+        "async": true,
+        "parameters": [
+          {
+            "name": "calendarId",
+            "type": "string",
+            "description": "ID of the calendar to remove."
+          }
+        ]
+      },
+      {
+        "name": "getItems",
+        "type": "function",
+        "description": "Returns calendar items (events/tasks) from a specific calendar.",
+        "async": true,
+        "parameters": [
+          {
+            "name": "calendarId",
+            "type": "string",
+            "description": "ID of the calendar."
+          },
+          {
+            "name": "itemType",
+            "type": "string",
+            "description": "Type of items: 'events', 'tasks', or 'all'.",
+            "enum": ["events", "tasks", "all"]
+          },
+          {
+            "name": "rangeStartIso",
+            "type": "string",
+            "description": "ISO 8601 start date for the range filter (optional).",
+            "optional": true
+          },
+          {
+            "name": "rangeEndIso",
+            "type": "string",
+            "description": "ISO 8601 end date for the range filter (optional).",
+            "optional": true
+          }
+        ]
+      },
+      {
+        "name": "addItem",
+        "type": "function",
+        "description": "Adds a calendar item (event/task) using iCalendar (ICS) data.",
+        "async": true,
+        "parameters": [
+          {
+            "name": "calendarId",
+            "type": "string",
+            "description": "ID of the target calendar."
+          },
+          {
+            "name": "icsData",
+            "type": "string",
+            "description": "iCalendar (ICS) formatted string representing the item."
+          }
+        ]
+      },
+      {
+        "name": "updateItem",
+        "type": "function",
+        "description": "Updates an existing calendar item using iCalendar (ICS) data.",
+        "async": true,
+        "parameters": [
+          {
+            "name": "calendarId",
+            "type": "string",
+            "description": "ID of the calendar containing the item."
+          },
+          {
+            "name": "itemId",
+            "type": "string",
+            "description": "ID of the item to update."
+          },
+          {
+            "name": "icsData",
+            "type": "string",
+            "description": "Updated iCalendar (ICS) formatted string."
+          }
+        ]
+      },
+      {
+        "name": "deleteItem",
+        "type": "function",
+        "description": "Deletes a calendar item.",
+        "async": true,
+        "parameters": [
+          {
+            "name": "calendarId",
+            "type": "string",
+            "description": "ID of the calendar containing the item."
+          },
+          {
+            "name": "itemId",
+            "type": "string",
+            "description": "ID of the item to delete."
+          }
+        ]
+      },
+      {
+        "name": "setCalendarProperty",
+        "type": "function",
+        "description": "Sets a custom property on a calendar.",
+        "async": true,
+        "parameters": [
+          {
+            "name": "calendarId",
+            "type": "string",
+            "description": "ID of the calendar."
+          },
+          {
+            "name": "key",
+            "type": "string",
+            "description": "Property key."
+          },
+          {
+            "name": "value",
+            "type": "string",
+            "description": "Property value."
+          }
+        ]
+      },
+      {
+        "name": "getCalendarProperty",
+        "type": "function",
+        "description": "Gets a custom property from a calendar.",
+        "async": true,
+        "parameters": [
+          {
+            "name": "calendarId",
+            "type": "string",
+            "description": "ID of the calendar."
+          },
+          {
+            "name": "key",
+            "type": "string",
+            "description": "Property key."
+          }
+        ]
+      }
+    ],
+    "events": [
+      {
+        "name": "onItemChanged",
+        "type": "function",
+        "description": "Fired when a calendar item is added, modified, or deleted locally.",
+        "parameters": [
+          {
+            "name": "changeInfo",
+            "type": "object",
+            "properties": {
+              "calendarId": { "type": "string" },
+              "itemId": { "type": "string" },
+              "changeType": { "type": "string", "enum": ["added", "modified", "deleted"] },
+              "icsData": { "type": "string", "optional": true }
+            }
+          }
+        ]
+      }
+    ]
+  }
+]
