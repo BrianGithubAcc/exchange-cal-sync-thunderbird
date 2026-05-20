@@ -52,15 +52,18 @@ var CalendarAPI = class extends ExtensionCommon.ExtensionAPI {
         }
         if (start) {
           try {
-            if (start.icalString) {
-              lines.push("DTSTART:" + start.icalString);
-            } else if (start.jsDate) {
-              var jsDate = start.jsDate;
-              if (start.isDate) {
-                lines.push("DTSTART:" + jsDate.toISOString().replace(/[-:]/g, "").substring(0, 8));
-              } else {
-                lines.push("DTSTART:" + jsDate.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, ""));
+            if (start.isDate) {
+              // All-day event: use date-only format (no timezone conversion)
+              if (start.icalString) {
+                lines.push("DTSTART;VALUE=DATE:" + start.icalString);
+              } else if (start.jsDate) {
+                lines.push("DTSTART;VALUE=DATE:" + start.jsDate.toISOString().replace(/[-:]/g, "").substring(0, 8));
               }
+            } else if (start.jsDate) {
+              // Timed event: always use UTC via jsDate to preserve timezone accuracy
+              lines.push("DTSTART:" + start.jsDate.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, ""));
+            } else if (start.icalString) {
+              lines.push("DTSTART:" + start.icalString);
             }
           } catch (de) {
             console.warn("[ExCalSync API] itemToIcs: could not serialize start date:", de);
@@ -68,15 +71,18 @@ var CalendarAPI = class extends ExtensionCommon.ExtensionAPI {
         }
         if (end) {
           try {
-            if (end.icalString) {
-              lines.push("DTEND:" + end.icalString);
-            } else if (end.jsDate) {
-              var jsDate2 = end.jsDate;
-              if (end.isDate) {
-                lines.push("DTEND:" + jsDate2.toISOString().replace(/[-:]/g, "").substring(0, 8));
-              } else {
-                lines.push("DTEND:" + jsDate2.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, ""));
+            if (end.isDate) {
+              // All-day event: use date-only format (no timezone conversion)
+              if (end.icalString) {
+                lines.push("DTEND;VALUE=DATE:" + end.icalString);
+              } else if (end.jsDate) {
+                lines.push("DTEND;VALUE=DATE:" + end.jsDate.toISOString().replace(/[-:]/g, "").substring(0, 8));
               }
+            } else if (end.jsDate) {
+              // Timed event: always use UTC via jsDate to preserve timezone accuracy
+              lines.push("DTEND:" + end.jsDate.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, ""));
+            } else if (end.icalString) {
+              lines.push("DTEND:" + end.icalString);
             }
           } catch (de2) {
             console.warn("[ExCalSync API] itemToIcs: could not serialize end date:", de2);

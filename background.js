@@ -571,13 +571,42 @@ browser.runtime.onMessage.addListener(async function (message) {
         return await loadPendingInvites();
       }
       if (message.action === "acceptInvite") {
-        await acceptPendingInvite(message.notifId);
+        await acceptPendingInvite(message.notifId, message.calendarId);
         return { success: true };
       }
       if (message.action === "dismissInvite") {
         var pending = await loadPendingInvites();
         delete pending[message.notifId];
         await savePendingInvites(pending);
+        return { success: true };
+      }
+      if (message.action === "getAllCalendars") {
+        return await browser.CalendarAPI.getCalendars();
+      }
+      if (message.action === "getMailAccounts") {
+        try {
+          var mailAccounts = await browser.accounts.list();
+          return mailAccounts.map(function (a) {
+            var email = "";
+            if (a.identities && a.identities.length > 0) {
+              email = a.identities[0].email || "";
+            }
+            return { id: a.id, name: a.name || email, email: email, type: a.type };
+          }).filter(function (a) { return a.email; });
+        } catch (e) {
+          console.error("[ExCalSync] getMailAccounts error:", e);
+          return [];
+        }
+      }
+      if (message.action === "getImipAccountMap") {
+        var mapStore = await browser.storage.local.get([IMIP_ACCOUNT_MAP_KEY]);
+        return mapStore[IMIP_ACCOUNT_MAP_KEY] || {};
+      }
+      if (message.action === "setImipAccountMap") {
+        var mapObj = {};
+        mapObj[IMIP_ACCOUNT_MAP_KEY] = message.accountMap || {};
+        await browser.storage.local.set(mapObj);
+        console.log("[ExCalSync] iMIP account map saved:", JSON.stringify(message.accountMap));
         return { success: true };
       }
       if (message.action === "checkMeetingMessage") {
@@ -780,7 +809,7 @@ async function respondToMeetingAction(responseType, itemId, changeKey, accountId
 
 var MEETING_UID_MAP_KEY = "meetingUidMap";
 var PENDING_INVITES_KEY = "pendingInvites";
-var FALLBACK_CAL_ID_KEY = "fallbackCalendarId";
+var IMIP_ACCOUNT_MAP_KEY = "imipAccountCalendarMap";
 
 /**
  * Load the meeting UID map from storage.
@@ -816,7 +845,7 @@ async function savePendingInvites(invites) {
  * Returns an array of { calendarId, accountId, isExchange }.
  * Matches our accounts against the ATTENDEE list, skipping the organizer.
  */
-async function findTargetCalendars(parsed) {
+async function findTargetCalendars(parsed, receivingAccountId) {
   var acctList = await loadAccounts();
   var targets = [];
 
@@ -869,30 +898,31 @@ async function findTargetCalendars(parsed) {
     }
   }
 
-  // 4) No Exchange match — use/create a fallback calendar
-  var fallbackData = await browser.storage.local.get([FALLBACK_CAL_ID_KEY]);
-  var fallbackCalId = fallbackData[FALLBACK_CAL_ID_KEY];
+  // 4) No Exchange match — look up per-account calendar mapping
+  var mapData = await browser.storage.local.get([IMIP_ACCOUNT_MAP_KEY]);
+  var accountMap = mapData[IMIP_ACCOUNT_MAP_KEY] || {};
 
-  if (fallbackCalId) {
+  if (receivingAccountId && accountMap[receivingAccountId]) {
+    var mappedCalId = accountMap[receivingAccountId];
+    if (mappedCalId === "disabled") {
+      console.log("[ExCalSync iMIP] iMIP disabled for mail account", receivingAccountId);
+      return [];
+    }
+    // Verify the mapped calendar still exists
     try {
       var calendars = await browser.CalendarAPI.getCalendars();
-      var exists = calendars.some(function (c) { return c.id === fallbackCalId; });
+      var exists = calendars.some(function (c) { return c.id === mappedCalId; });
       if (exists) {
-        return [{ calendarId: fallbackCalId, accountId: null, isExchange: false }];
+        console.log("[ExCalSync iMIP] Using mapped calendar for account", receivingAccountId);
+        return [{ calendarId: mappedCalId, accountId: null, isExchange: false }];
       }
-    } catch (e) { /* fall through to create */ }
+    } catch (e) { /* fall through */ }
+    console.log("[ExCalSync iMIP] Mapped calendar not found for account", receivingAccountId);
   }
 
-  try {
-    var newCal = await browser.CalendarAPI.createCalendar("Meeting Invitations", "#E74C3C");
-    var store = {};
-    store[FALLBACK_CAL_ID_KEY] = newCal.id;
-    await browser.storage.local.set(store);
-    return [{ calendarId: newCal.id, accountId: null, isExchange: false }];
-  } catch (e) {
-    console.error("[ExCalSync iMIP] Failed to create fallback calendar:", e);
-    return [];
-  }
+  // No mapping configured for this account — let Thunderbird handle it
+  console.log("[ExCalSync iMIP] No iMIP mapping for mail account", receivingAccountId || "(unknown)", ", skipping");
+  return [];
 }
 
 /**
@@ -1055,7 +1085,7 @@ async function handleMeetingUpdate(parsed, messageId, target) {
 /**
  * Accept a pending meeting invitation (called from notification click or options page).
  */
-async function acceptPendingInvite(notifId) {
+async function acceptPendingInvite(notifId, overrideCalendarId) {
   var pendingInvites = await loadPendingInvites();
   var invite = pendingInvites[notifId];
   if (!invite) {
@@ -1063,14 +1093,16 @@ async function acceptPendingInvite(notifId) {
     return;
   }
 
+  var targetCalId = overrideCalendarId || invite.calendarId;
+
   try {
-    var result = await browser.CalendarAPI.addItem(invite.calendarId, invite.parsed.rawIcs);
-    console.log("[ExCalSync iMIP] Added meeting to calendar, localId:", result.id);
+    var result = await browser.CalendarAPI.addItem(targetCalId, invite.parsed.rawIcs);
+    console.log("[ExCalSync iMIP] Added meeting to calendar", targetCalId, "localId:", result.id);
 
     // Update UID map
     var uidMap = await loadMeetingUidMap();
     uidMap[invite.parsed.uid] = {
-      calendarId: invite.calendarId,
+      calendarId: targetCalId,
       localItemId: result.id,
       sequence: invite.parsed.sequence,
     };
@@ -1093,7 +1125,7 @@ async function acceptPendingInvite(notifId) {
 /**
  * Process a single message for iCalendar content.
  */
-async function processMessageForInvites(messageId) {
+async function processMessageForInvites(messageId, receivingAccountId) {
   try {
     // Check inline text parts for text/calendar
     var inlineParts = await browser.messages.listInlineTextParts(messageId);
@@ -1101,7 +1133,7 @@ async function processMessageForInvites(messageId) {
       if (isCalendarInvite(part.contentType)) {
         var parsed = parseICalendar(part.content);
         if (parsed) {
-          await routeMeetingAction(parsed, messageId);
+          await routeMeetingAction(parsed, messageId, receivingAccountId);
           return; // One invite per message is typical
         }
       }
@@ -1115,7 +1147,7 @@ async function processMessageForInvites(messageId) {
         var content = await file.text();
         var parsed = parseICalendar(content);
         if (parsed) {
-          await routeMeetingAction(parsed, messageId);
+          await routeMeetingAction(parsed, messageId, receivingAccountId);
           return;
         }
       }
@@ -1128,8 +1160,8 @@ async function processMessageForInvites(messageId) {
 /**
  * Route a parsed iCalendar to the appropriate handler based on METHOD.
  */
-async function routeMeetingAction(parsed, messageId) {
-  var targets = await findTargetCalendars(parsed);
+async function routeMeetingAction(parsed, messageId, receivingAccountId) {
+  var targets = await findTargetCalendars(parsed, receivingAccountId);
   if (targets.length === 0) {
     console.log("[ExCalSync iMIP] No target calendar found, skipping");
     return;
@@ -1164,8 +1196,9 @@ async function routeMeetingAction(parsed, messageId) {
  */
 browser.messages.onNewMailReceived.addListener(async function (folder, messages) {
   console.log("[ExCalSync iMIP] New mail received:", messages.messages.length, "messages in", folder.name);
+  var receivingAccountId = folder.accountId || null;
   for (var msg of messages.messages) {
-    await processMessageForInvites(msg.id);
+    await processMessageForInvites(msg.id, receivingAccountId);
   }
 });
 

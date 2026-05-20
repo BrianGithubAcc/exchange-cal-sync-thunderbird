@@ -179,12 +179,16 @@ function icsToEwsFields(icsData) {
  * Convert ISO date string to ICS format.
  */
 function dateToIcsFormat(isoString, isAllDay) {
+  if (isAllDay) {
+    // For all-day events, extract date directly to avoid timezone shifting
+    const dateMatch = isoString.match(/^(\d{4})-?(\d{2})-?(\d{2})/);
+    if (dateMatch) {
+      return dateMatch[1] + dateMatch[2] + dateMatch[3];
+    }
+  }
   const d = new Date(isoString);
   if (isNaN(d.getTime())) return isoString;
 
-  if (isAllDay) {
-    return d.toISOString().replace(/[-:]/g, "").substring(0, 8);
-  }
   return d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
 }
 
@@ -196,9 +200,19 @@ function icsDateToIso(icsDate) {
     // All-day: YYYYMMDD
     return `${icsDate.substring(0, 4)}-${icsDate.substring(4, 6)}-${icsDate.substring(6, 8)}`;
   }
-  // DateTime: YYYYMMDDTHHMMSSZ
+  // DateTime: YYYYMMDDTHHMMSSZ or YYYYMMDDTHHMMSS (floating)
+  const hasUtcSuffix = icsDate.endsWith("Z");
   const clean = icsDate.replace("Z", "");
-  return `${clean.substring(0, 4)}-${clean.substring(4, 6)}-${clean.substring(6, 8)}T${clean.substring(9, 11)}:${clean.substring(11, 13)}:${clean.substring(13, 15)}Z`;
+  const formatted = `${clean.substring(0, 4)}-${clean.substring(4, 6)}-${clean.substring(6, 8)}T${clean.substring(9, 11)}:${clean.substring(11, 13)}:${clean.substring(13, 15)}`;
+  if (hasUtcSuffix) {
+    return formatted + "Z";
+  }
+  // Floating time (no Z suffix): convert from local time to UTC
+  const d = new Date(formatted);
+  if (!isNaN(d.getTime())) {
+    return d.toISOString();
+  }
+  return formatted;
 }
 
 function icsEscapeValue(str) {
