@@ -2,10 +2,32 @@ console.log("[ExCalSync] client.js loading");
 /**
  * EWS (Exchange Web Services) Client.
  * Handles authenticated SOAP communication with Exchange servers.
- * Supports Basic Auth and OAuth 2.0 Bearer tokens.
+ * Uses OAuth 2.0 Bearer tokens for Exchange Online.
  */
 
-// Depends on: ews/xml-builder.js, ews/autodiscover.js
+// Depends on: ews/xml-builder.js
+
+const DEFAULT_EWS_URL = "https://outlook.office365.com/EWS/Exchange.asmx";
+
+function validateEwsUrl(url) {
+  const value = url || DEFAULT_EWS_URL;
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch (e) {
+    throw new Error("Invalid EWS URL");
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.hostname !== "outlook.office365.com" ||
+    parsed.port || parsed.username || parsed.password ||
+    parsed.search || parsed.hash ||
+    parsed.pathname !== "/EWS/Exchange.asmx"
+  ) {
+    throw new Error("EWS URL must be https://outlook.office365.com/EWS/Exchange.asmx");
+  }
+  return DEFAULT_EWS_URL;
+}
 
 /**
  * Parse XML response text into a DOM Document.
@@ -83,16 +105,13 @@ class EwsClient {
   /**
    * @param {object} config
    * @param {string} config.email - User email address
-   * @param {string} [config.ewsUrl] - EWS endpoint URL (auto-discovered if not provided)
+   * @param {string} [config.ewsUrl] - Microsoft 365 EWS endpoint URL
    * @param {object} config.credentials - Auth credentials
-   * @param {string} config.credentials.type - 'basic' or 'oauth'
-   * @param {string} [config.credentials.username] - For basic auth
-   * @param {string} [config.credentials.password] - For basic auth
    * @param {string} [config.credentials.token] - For OAuth bearer token
    */
   constructor(config) {
     this.email = config.email;
-    this.ewsUrl = config.ewsUrl || null;
+    this.ewsUrl = validateEwsUrl(config.ewsUrl || DEFAULT_EWS_URL);
     this.credentials = config.credentials;
     this._verified = false;
   }
@@ -105,19 +124,7 @@ class EwsClient {
       "Content-Type": "text/xml; charset=utf-8",
     };
 
-    if (this.credentials.type === "basic") {
-      if (!this.credentials.username || !this.credentials.password) {
-        throw new Error("Basic auth requires username and password");
-      }
-      const encoded = btoa(
-        String.fromCharCode(
-          ...new TextEncoder().encode(
-            `${this.credentials.username}:${this.credentials.password}`
-          )
-        )
-      );
-      headers["Authorization"] = `Basic ${encoded}`;
-    } else if (this.credentials.type === "oauth") {
+    if (this.credentials.type === "oauth") {
       if (!this.credentials.token) {
         throw new Error("OAuth requires an access token");
       }
@@ -139,11 +146,7 @@ class EwsClient {
 
     const headers = this._getAuthHeaders();
 
-    let response = await fetch(this.ewsUrl, {
-      method: "POST",
-      headers,
-      body: soapXml,
-    });
+    let response = await this._fetch(this.ewsUrl, headers, soapXml);
 
     if (response.status === 401 && this.credentials.type === "oauth" && this._refreshTokenFn) {
       // Try to refresh the OAuth token and retry once
@@ -152,19 +155,13 @@ class EwsClient {
       if (newToken) {
         this.credentials.token = newToken;
         const retryHeaders = this._getAuthHeaders();
-        response = await fetch(this.ewsUrl, {
-          method: "POST",
-          headers: retryHeaders,
-          body: soapXml,
-        });
+        response = await this._fetch(this.ewsUrl, retryHeaders, soapXml);
       }
     }
 
     if (response.status === 401) {
       throw new Error(
-        "Authentication failed (HTTP 401). Check your credentials. " +
-          "If using Basic Auth with Microsoft 365, it may be disabled for your tenant. " +
-          "Consider using OAuth 2.0 instead."
+          "Authentication failed (HTTP 401). Sign in again with Microsoft OAuth."
       );
     }
 
@@ -186,33 +183,32 @@ class EwsClient {
     return doc;
   }
 
+  async _fetch(url, headers, body) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    try {
+      return await fetch(url, {
+        method: "POST",
+        headers,
+        body,
+        redirect: "error",
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   /**
    * Connect to Exchange: discover EWS URL if needed and verify connectivity.
    */
   async connect() {
-    // Step 1: Discover EWS URL if not provided
-    if (!this.ewsUrl) {
-      console.log("[EWS] Starting autodiscover for:", this.email);
-      try {
-        this.ewsUrl = await autodiscover(this.email, this.credentials);
-      } catch (e) {
-        console.error("[EWS] Autodiscover failed:", e.message);
-        // For M365, try the standard URL as fallback
-        console.log("[EWS] Trying standard M365 EWS URL as fallback...");
-        this.ewsUrl = "https://outlook.office365.com/EWS/Exchange.asmx";
-      }
-      console.log("[EWS] Using URL:", this.ewsUrl);
-    } else {
-      this.ewsUrl = validateEwsUrl(this.ewsUrl);
-      console.log("[EWS] Using provided URL:", this.ewsUrl);
-    }
+    this.ewsUrl = validateEwsUrl(this.ewsUrl);
 
-    // Step 2: Verify connectivity by fetching a small date range
+    // Verify the default calendar folder before reading events.
     console.log("[EWS] Verifying connection...");
-    const now = new Date();
-    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     try {
-      await this.findCalendarItems(weekAgo, now);
+      await this.getCalendarFolder();
       this._verified = true;
       console.log("[EWS] Connection verified successfully");
       return { success: true, ewsUrl: this.ewsUrl };
@@ -220,6 +216,19 @@ class EwsClient {
       this._verified = false;
       throw new Error(`Connection verification failed: ${e.message}`);
     }
+  }
+
+  async getCalendarFolder() {
+    const doc = await this._sendRequest(buildGetCalendarFolderRequest());
+    const folder = getElementsByLocalName(doc, "CalendarFolder")[0] ||
+      getElementsByLocalName(doc, "Folder")[0];
+    if (!folder) throw new Error("EWS did not return the default calendar folder");
+    const id = getElementsByLocalName(folder, "FolderId")[0];
+    return {
+      id: id && id.getAttribute("Id"),
+      changeKey: id && id.getAttribute("ChangeKey"),
+      displayName: getTagText(folder, "DisplayName") || "Calendar",
+    };
   }
 
   /**
@@ -404,6 +413,25 @@ class EwsClient {
     }
 
     return changes;
+  }
+
+  /**
+   * Establish an incremental-sync cursor without applying the returned
+   * changes. This is used after the initial CalendarView import so later
+   * refreshes do not repeatedly perform a full sync.
+   */
+  async establishSyncState() {
+    let syncState = null;
+    let complete = false;
+    while (!complete) {
+      const changes = await this.syncFolderItems(syncState);
+      syncState = changes.syncState;
+      complete = changes.includesLastItem;
+      if (!syncState) {
+        throw new Error("EWS did not return a SyncState for the calendar");
+      }
+    }
+    return syncState;
   }
 
   /**

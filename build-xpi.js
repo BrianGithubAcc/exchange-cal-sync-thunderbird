@@ -5,7 +5,6 @@
 
 const fs = require("fs");
 const path = require("path");
-const { execSync } = require("child_process");
 
 const OUTPUT = "exchange-calendar-sync.xpi";
 const ROOT = __dirname;
@@ -19,7 +18,6 @@ const INCLUDES = [
   "sync",
   "api",
   "options",
-  "meetingbar",
   "icons",
 ];
 

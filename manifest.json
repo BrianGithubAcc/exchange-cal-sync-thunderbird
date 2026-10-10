@@ -1,14 +1,14 @@
 {
   "manifest_version": 2,
   "name": "Exchange Calendar Sync",
-  "version": "2.0.0",
-  "description": "Syncs calendar data from Microsoft Exchange (EWS) to local Thunderbird calendars. Supports OAuth 2.0 and Basic Auth.",
+  "version": "2.0.8",
+  "description": "Two-way Microsoft Exchange calendar sync through EWS and Thunderbird's native Calendar.",
   "author": "Peter Schenkel",
   "browser_specific_settings": {
     "gecko": {
-      "id": "exchange-calendar-sync@pschenkel",
+      "id": "exchange-calendar-sync-local@brian",
       "strict_min_version": "128.0",
-      "strict_max_version": "150.*"
+      "strict_max_version": "153.*"
     }
   },
   "icons": {
@@ -19,10 +19,8 @@
   "background": {
     "scripts": [
       "ews/xml-builder.js",
-      "ews/autodiscover.js",
       "ews/client.js",
       "sync/engine.js",
-      "sync/imip.js",
       "background.js"
     ]
   },
@@ -34,11 +32,8 @@
   "permissions": [
     "storage",
     "alarms",
-    "messagesRead",
-    "accountsRead",
-    "notifications",
-    "messagesUpdate",
-    "<all_urls>"
+    "https://login.microsoftonline.com/*",
+    "https://outlook.office365.com/*"
   ],
   "experiment_apis": {
     "CalendarAPI": {
@@ -48,6 +43,14 @@
         "paths": [["CalendarAPI"]],
         "script": "api/CalendarAPI/implementation.js"
       }
+    },
+    "SecureStorage": {
+      "schema": "api/SecureStorage/schema.json",
+      "parent": {
+        "scopes": ["addon_parent"],
+        "paths": [["SecureStorage"]],
+        "script": "api/SecureStorage/implementation.js"
+      }
     }
   },
   "browser_action": {
@@ -56,13 +59,5 @@
       "16": "icons/icon-16.svg",
       "32": "icons/icon-32.svg"
     }
-  },
-  "message_display_action": {
-    "default_title": "Meeting Response",
-    "default_icon": {
-      "16": "icons/icon-16.svg",
-      "32": "icons/icon-32.svg"
-    },
-    "default_popup": "meetingbar/popup.html"
   }
 }

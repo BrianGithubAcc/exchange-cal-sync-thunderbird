@@ -26,6 +26,14 @@ var CalendarAPI = class extends ExtensionCommon.ExtensionAPI {
       return null;
     }
 
+    function managedCalendar(calendarId) {
+      const calendar = findCalendar(calendarId);
+      if (!calendar || calendar.getProperty(MANAGED_PROP) !== "true") {
+        throw new ExtensionError("Calendar is not managed by Exchange Calendar Sync");
+      }
+      return calendar;
+    }
+
     function icsEscape(str) {
       if (!str) return "";
       return str.replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\n/g, "\\n");
@@ -33,6 +41,16 @@ var CalendarAPI = class extends ExtensionCommon.ExtensionAPI {
 
     function itemToIcs(item) {
       try {
+        // Prefer Thunderbird's complete serialization. The fallback below is
+        // only for older calendar implementations without icalString.
+        try {
+          if (typeof item.icalString === "string" &&
+              item.icalString.length <= 1024 * 1024 &&
+              item.icalString.indexOf("BEGIN:VCALENDAR") !== -1) {
+            return item.icalString;
+          }
+        } catch (serializationError) { /* use the compatibility serializer */ }
+
         var start = item.startDate || item.entryDate;
         var end = item.endDate || item.dueDate;
         var lines = [
@@ -126,6 +144,7 @@ var CalendarAPI = class extends ExtensionCommon.ExtensionAPI {
         onPropertyDeleting() {},
 
         onAddItem(item) {
+          if (!item.calendar || item.calendar.getProperty(MANAGED_PROP) !== "true") return;
           changeObserver.notify({
             calendarId: String(item.calendar.id),
             itemId: String(item.id),
@@ -135,6 +154,7 @@ var CalendarAPI = class extends ExtensionCommon.ExtensionAPI {
         },
 
         onModifyItem(newItem) {
+          if (!newItem.calendar || newItem.calendar.getProperty(MANAGED_PROP) !== "true") return;
           changeObserver.notify({
             calendarId: String(newItem.calendar.id),
             itemId: String(newItem.id),
@@ -144,6 +164,7 @@ var CalendarAPI = class extends ExtensionCommon.ExtensionAPI {
         },
 
         onDeleteItem(item) {
+          if (!item.calendar || item.calendar.getProperty(MANAGED_PROP) !== "true") return;
           changeObserver.notify({
             calendarId: String(item.calendar.id),
             itemId: String(item.id),
@@ -191,6 +212,7 @@ var CalendarAPI = class extends ExtensionCommon.ExtensionAPI {
             var calendars = calMgr.getCalendars();
             var result = [];
             for (var c of calendars) {
+              if (c.getProperty(MANAGED_PROP) !== "true") continue;
               result.push({
                 id: String(c.id),
                 name: String(c.name || ""),
@@ -234,20 +256,14 @@ var CalendarAPI = class extends ExtensionCommon.ExtensionAPI {
 
         async removeCalendar(calendarId) {
           console.log("[ExCalSync API] removeCalendar:", calendarId);
-          var calendar = findCalendar(calendarId);
-          if (!calendar) {
-            throw new ExtensionError("Calendar not found: " + calendarId);
-          }
+          var calendar = managedCalendar(calendarId);
           calMgr.removeCalendar(calendar);
           return true;
         },
 
         async getItems(calendarId, itemType, rangeStartIso, rangeEndIso) {
           console.log("[ExCalSync API] getItems:", calendarId, itemType);
-          var calendar = findCalendar(calendarId);
-          if (!calendar) {
-            throw new ExtensionError("Calendar not found: " + calendarId);
-          }
+          var calendar = managedCalendar(calendarId);
 
           try {
             var filter = Components.interfaces.calICalendar.ITEM_FILTER_TYPE_EVENT |
@@ -313,10 +329,7 @@ var CalendarAPI = class extends ExtensionCommon.ExtensionAPI {
         },
 
         async addItem(calendarId, icsData) {
-          var calendar = findCalendar(calendarId);
-          if (!calendar) {
-            throw new ExtensionError("Calendar not found: " + calendarId);
-          }
+          var calendar = managedCalendar(calendarId);
 
           var item = icsToItem(icsData);
           if (!item) {
@@ -362,10 +375,7 @@ var CalendarAPI = class extends ExtensionCommon.ExtensionAPI {
 
         async updateItem(calendarId, itemId, icsData) {
           console.log("[ExCalSync API] updateItem:", itemId);
-          var calendar = findCalendar(calendarId);
-          if (!calendar) {
-            throw new ExtensionError("Calendar not found: " + calendarId);
-          }
+          var calendar = managedCalendar(calendarId);
 
           var newItem = icsToItem(icsData);
           if (!newItem) {
@@ -458,10 +468,7 @@ var CalendarAPI = class extends ExtensionCommon.ExtensionAPI {
 
         async deleteItem(calendarId, itemId) {
           console.log("[ExCalSync API] deleteItem:", itemId);
-          var calendar = findCalendar(calendarId);
-          if (!calendar) {
-            throw new ExtensionError("Calendar not found: " + calendarId);
-          }
+          var calendar = managedCalendar(calendarId);
 
           try {
             var filter = Components.interfaces.calICalendar.ITEM_FILTER_TYPE_EVENT |
@@ -508,19 +515,13 @@ var CalendarAPI = class extends ExtensionCommon.ExtensionAPI {
         },
 
         async setCalendarProperty(calendarId, key, value) {
-          var calendar = findCalendar(calendarId);
-          if (!calendar) {
-            throw new ExtensionError("Calendar not found: " + calendarId);
-          }
+          var calendar = managedCalendar(calendarId);
           calendar.setProperty(key, value);
           return true;
         },
 
         async getCalendarProperty(calendarId, key) {
-          var calendar = findCalendar(calendarId);
-          if (!calendar) {
-            throw new ExtensionError("Calendar not found: " + calendarId);
-          }
+          var calendar = managedCalendar(calendarId);
           var val = calendar.getProperty(key);
           return val != null ? String(val) : null;
         },

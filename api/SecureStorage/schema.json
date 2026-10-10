@@ -1,0 +1,85 @@
+[
+  {
+    "namespace": "SecureStorage",
+    "description": "Small privileged wrapper around Thunderbird's Login Manager.",
+    "functions": [
+      {
+        "name": "get",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          { "name": "key", "type": "string" }
+        ],
+        "returns": {
+          "type": "object",
+          "properties": {
+            "found": { "type": "boolean" },
+            "value": { "type": "string", "optional": true }
+          }
+        }
+      },
+      {
+        "name": "set",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          { "name": "key", "type": "string" },
+          { "name": "value", "type": "string" }
+        ],
+        "returns": { "type": "boolean" }
+      },
+      {
+        "name": "remove",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          { "name": "key", "type": "string" }
+        ],
+        "returns": { "type": "boolean" }
+      },
+      {
+        "name": "startDeviceCode",
+        "type": "function",
+        "async": true,
+        "parameters": [],
+        "returns": {
+          "type": "object",
+          "properties": {
+            "status": { "type": "integer" },
+            "body": { "type": "string" }
+          }
+        }
+      },
+      {
+        "name": "pollDeviceCode",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          { "name": "deviceCode", "type": "string" }
+        ],
+        "returns": {
+          "type": "object",
+          "properties": {
+            "status": { "type": "integer" },
+            "body": { "type": "string" }
+          }
+        }
+      },
+      {
+        "name": "refreshAccessToken",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          { "name": "refreshToken", "type": "string" }
+        ],
+        "returns": {
+          "type": "object",
+          "properties": {
+            "status": { "type": "integer" },
+            "body": { "type": "string" }
+          }
+        }
+      }
+    ]
+  }
+]

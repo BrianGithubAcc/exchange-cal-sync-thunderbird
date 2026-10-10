@@ -24,9 +24,10 @@ function ewsItemToIcs(ewsItem) {
     "BEGIN:VEVENT",
   ];
 
-  // Use Exchange Item ID as UID (base64-safe)
+  // Use an injective encoding of the Exchange Item ID. A short 32-bit hash
+  // can collide and would merge two unrelated events.
   const uid = ewsItem.id
-    ? `ews-${hashCode(ewsItem.id)}@exchange-cal-sync`
+    ? stableEwsUid(ewsItem.id)
     : `ews-${Date.now()}@exchange-cal-sync`;
   lines.push(`UID:${uid}`);
 
@@ -97,18 +98,20 @@ function ewsItemToIcs(ewsItem) {
   }
   if (ewsItem.organizer) {
     const orgCn = ewsItem.organizer.name ? `;CN=${icsEscapeValue(ewsItem.organizer.name)}` : "";
-    if (ewsItem.organizer.email) {
-      lines.push(`ORGANIZER${orgCn}:mailto:${ewsItem.organizer.email}`);
+    const organizerEmail = safeIcsEmail(ewsItem.organizer.email);
+    if (organizerEmail) {
+      lines.push(`ORGANIZER${orgCn}:mailto:${organizerEmail}`);
     }
   }
   if (ewsItem.attendees) {
     for (const att of ewsItem.attendees) {
       const role =
         att.type === "optional" ? "OPT-PARTICIPANT" : "REQ-PARTICIPANT";
-      const cn = att.name ? `;CN=${icsEscapeValue(att.name)}` : "";
-      lines.push(
-        `ATTENDEE;ROLE=${role}${cn}:mailto:${att.email}`
-      );
+      const attendeeEmail = safeIcsEmail(att.email);
+      if (attendeeEmail) {
+        const cn = att.name ? `;CN=${icsEscapeParameter(att.name)}` : "";
+        lines.push(`ATTENDEE;ROLE=${role}${cn}:mailto:${attendeeEmail}`);
+      }
     }
   }
   if (ewsItem.lastModified) {
@@ -155,6 +158,29 @@ function icsToEwsFields(icsData) {
       case "DTEND":
         fields.end = icsDateToIso(value);
         break;
+      case "CLASS":
+        fields.sensitivity = {
+          PRIVATE: "Private",
+          CONFIDENTIAL: "Confidential",
+        }[value.toUpperCase()] || "Normal";
+        break;
+    }
+  }
+
+  const reminderMatch = icsData.match(/TRIGGER:-PT(\d+)M/i);
+  if (reminderMatch) {
+    fields.reminderSet = true;
+    fields.reminderMinutes = Number.parseInt(reminderMatch[1], 10);
+  }
+
+  if (fields.isAllDay) {
+    // EWS requires DateTime values even when IsAllDayEvent is true. Keep the
+    // date at midnight UTC so the date does not shift across local timezones.
+    if (fields.start && fields.start.length === 10) {
+      fields.start += "T00:00:00Z";
+    }
+    if (fields.end && fields.end.length === 10) {
+      fields.end += "T00:00:00Z";
     }
   }
 
@@ -164,7 +190,7 @@ function icsToEwsFields(icsData) {
     if (!isNaN(d.getTime())) {
       if (fields.isAllDay) {
         d.setDate(d.getDate() + 1);
-        fields.end = d.toISOString().substring(0, 10);
+        fields.end = d.toISOString();
       } else {
         d.setHours(d.getHours() + 1);
         fields.end = d.toISOString();
@@ -225,6 +251,21 @@ function icsEscapeValue(str) {
     .replace(/\r/g, "");
 }
 
+function icsEscapeParameter(str) {
+  if (!str) return "";
+  return String(str).replace(/[\\;,\r\n]/g, function (ch) {
+    return ch === "\\" ? "\\\\" : "\\" + ch;
+  });
+}
+
+function safeIcsEmail(value) {
+  if (typeof value !== "string" || value.length > 320 ||
+      /[\r\n\x00-\x1f\x7f]/.test(value)) return null;
+  const email = value.trim();
+  if (!/^[^\s@<>]+@[^\s@<>]+$/.test(email)) return null;
+  return email;
+}
+
 function icsUnescapeValue(str) {
   if (!str) return "";
   return str
@@ -234,17 +275,12 @@ function icsUnescapeValue(str) {
     .replace(/\\\\/g, "\\");
 }
 
-/**
- * Simple string hash for generating stable UIDs.
- */
-function hashCode(str) {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    const char = str.charCodeAt(i);
-    hash = (hash << 5) - hash + char;
-    hash |= 0;
-  }
-  return Math.abs(hash).toString(36);
+function stableEwsUid(id) {
+  return `ews-${encodeURIComponent(String(id))}@exchange-cal-sync`;
+}
+
+function isEwsConflictError(error) {
+  return /changekey|conflict|itemnotfound/i.test(String(error && error.message));
 }
 
 /**
@@ -259,6 +295,10 @@ class SyncEngine {
     this.reverseMap = {}; // Maps: localItemId -> ewsItemId
     this._syncing = false;
     this._localChangesQueue = []; // Queue of local changes to push upstream
+    this.conflicts = {}; // local item id -> conflict details
+    this.lastError = null;
+    this._onLocalChange = null;
+    this._initialized = false;
     this._suppressLocalEvents = false; // Suppress observer during sync-from-remote
   }
 
@@ -290,11 +330,17 @@ class SyncEngine {
     console.log("[SyncEngine] Local calendar ready, id=", this.calendarId);
 
     // Listen for local changes (two-way sync)
-    browser.CalendarAPI.onItemChanged.addListener((changeInfo) => {
+    this._onLocalChange = (changeInfo) => {
       if (this._suppressLocalEvents) return;
       if (changeInfo.calendarId !== this.calendarId) return;
+      delete this.conflicts[changeInfo.itemId];
       this._localChangesQueue.push(changeInfo);
-    });
+      this._saveState().catch((e) => {
+        this.lastError = "Could not persist local calendar change: " + e.message;
+      });
+    };
+    browser.CalendarAPI.onItemChanged.addListener(this._onLocalChange);
+    this._initialized = true;
 
     console.log("[SyncEngine] Initialization complete");
     return { success: true, calendarId: this.calendarId };
@@ -334,6 +380,8 @@ class SyncEngine {
       syncState: this.syncState,
       itemMap: this.itemMap,
       reverseMap: this.reverseMap,
+      localChangesQueue: this._localChangesQueue,
+      conflicts: this.conflicts,
     });
   }
 
@@ -359,6 +407,10 @@ class SyncEngine {
       const end = new Date(
         now.getTime() + DEFAULT_SYNC_RANGE_FUTURE_DAYS * 24 * 60 * 60 * 1000
       );
+
+      // Capture the cursor before the CalendarView import. This ensures
+      // changes that occur during the import remain in the next pull.
+      const baselineSyncState = await this.ewsClient.establishSyncState();
 
       // Fetch all items from Exchange (summary only)
       const ewsSummaries = await this.ewsClient.findCalendarItems(start, end);
@@ -414,6 +466,7 @@ class SyncEngine {
 
       // Track which EWS items we've seen
       const seenEwsIds = new Set();
+      const calendarViewIds = new Set(ewsSummaries.map((item) => item.id));
       let itemIndex = 0;
 
       for (const ewsItem of ewsItems) {
@@ -432,7 +485,7 @@ class SyncEngine {
         if (!mapping) {
           // Check if local item already exists with matching UID (mapping was lost)
           const expectedUid = ewsItem.id
-            ? `ews-${hashCode(ewsItem.id)}@exchange-cal-sync`
+            ? stableEwsUid(ewsItem.id)
             : null;
           const existingLocal = expectedUid ? localItemsByUid[expectedUid] : null;
 
@@ -501,7 +554,9 @@ class SyncEngine {
 
       // Delete local items that no longer exist on Exchange
       for (const [ewsId, mapping] of Object.entries(this.itemMap)) {
-        if (!seenEwsIds.has(ewsId)) {
+        // CalendarView only covers the configured range. Never delete an
+        // event merely because it is outside that range.
+        if (calendarViewIds.has(ewsId) && !seenEwsIds.has(ewsId)) {
           try {
             await browser.CalendarAPI.deleteItem(
               this.calendarId,
@@ -518,6 +573,9 @@ class SyncEngine {
         }
       }
 
+      // Seed SyncFolderItems after the range import. Without this cursor the
+      // next periodic refresh would repeat the complete CalendarView import.
+      this.syncState = baselineSyncState;
       await this._saveState();
 
       const result = { created, updated, deleted, total: ewsItems.length };
@@ -572,6 +630,7 @@ class SyncEngine {
 
     let pushed = 0;
     let errors = 0;
+    let firstError = null;
 
     for (const change of queue) {
       try {
@@ -617,8 +676,14 @@ class SyncEngine {
       } catch (e) {
         console.error("[SyncEngine] Failed to push local change:", e);
         errors++;
-        // Re-queue failed changes for retry
-        this._localChangesQueue.push(change);
+        if (!firstError) firstError = e;
+        const ewsId = this.reverseMap[change.itemId];
+        if (ewsId && isEwsConflictError(e)) {
+          await this._recordConflict(change, ewsId, e);
+        } else {
+          // Re-queue transient failures for retry.
+          this._localChangesQueue.push(change);
+        }
       }
     }
 
@@ -627,6 +692,27 @@ class SyncEngine {
         `[SyncEngine] Pushed ${pushed} local changes, ${errors} errors`
       );
     }
+    if (firstError) {
+      await this._saveState();
+      throw firstError;
+    }
+  }
+
+  async _recordConflict(change, ewsId, error) {
+    let remote = null;
+    try {
+      const items = await this.ewsClient.getItems([{ id: ewsId }]);
+      remote = items[0] || null;
+    } catch (refreshError) {
+      console.error("[SyncEngine] Could not refresh conflicting item:", refreshError);
+    }
+    this.conflicts[change.itemId] = {
+      ewsId,
+      error: error.message,
+      remoteChangeKey: remote && remote.changeKey,
+      remoteLastModified: remote && remote.lastModified,
+      detectedAt: new Date().toISOString(),
+    };
   }
 
   /**
@@ -635,6 +721,7 @@ class SyncEngine {
   async _pullRemoteChanges() {
     // If no syncState, do a full sync instead
     if (!this.syncState) {
+      this._syncing = false;
       return await this.fullSync();
     }
 
@@ -644,8 +731,8 @@ class SyncEngine {
     let hasMore = true;
 
     while (hasMore) {
-      const changes = await this.ewsClient.syncFolderItems(this.syncState);
-      this.syncState = changes.syncState;
+      const cursor = this.syncState;
+      const changes = await this.ewsClient.syncFolderItems(cursor);
 
       // Handle created items
       if (changes.created.length > 0) {
@@ -689,6 +776,7 @@ class SyncEngine {
               created++;
             } catch (e) {
               console.error("[SyncEngine] Failed to create local item:", e);
+              throw e;
             }
           }
         }
@@ -716,12 +804,18 @@ class SyncEngine {
           if (ewsItem.isCancelled) {
             console.log("[SyncEngine] Item cancelled on Exchange, deleting locally:", ewsItem.subject);
             if (mapping) {
+              if (this.conflicts[mapping.localItemId]) {
+                this.conflicts[mapping.localItemId].remoteDeleted = true;
+                continue;
+              }
               try {
                 await browser.CalendarAPI.deleteItem(
                   this.calendarId,
                   mapping.localItemId
                 );
-              } catch (e) { /* already deleted */ }
+              } catch (e) {
+                throw e;
+              }
               delete this.reverseMap[mapping.localItemId];
               delete this.itemMap[ewsItem.id];
               deleted++;
@@ -730,6 +824,11 @@ class SyncEngine {
           }
 
           if (mapping) {
+            if (this.conflicts[mapping.localItemId]) {
+              this.conflicts[mapping.localItemId].remoteChangeKey = ewsItem.changeKey;
+              this.conflicts[mapping.localItemId].remoteLastModified = ewsItem.lastModified;
+              continue;
+            }
             const icsData = ewsItemToIcs(ewsItem);
             try {
               await browser.CalendarAPI.updateItem(
@@ -742,6 +841,7 @@ class SyncEngine {
               updated++;
             } catch (e) {
               console.error("[SyncEngine] Failed to update local item:", e);
+              throw e;
             }
           } else {
             // Item not mapped yet - treat as creation
@@ -760,6 +860,7 @@ class SyncEngine {
               created++;
             } catch (e) {
               console.error("[SyncEngine] Failed to create local item:", e);
+              throw e;
             }
           }
         }
@@ -770,13 +871,17 @@ class SyncEngine {
       for (const del of changes.deleted) {
         const mapping = this.itemMap[del.id];
         if (mapping) {
+          if (this.conflicts[mapping.localItemId]) {
+            this.conflicts[mapping.localItemId].remoteDeleted = true;
+            continue;
+          }
           try {
             await browser.CalendarAPI.deleteItem(
               this.calendarId,
               mapping.localItemId
             );
           } catch (e) {
-            // Already deleted locally, ignore
+            throw e;
           }
           delete this.reverseMap[mapping.localItemId];
           delete this.itemMap[del.id];
@@ -784,6 +889,9 @@ class SyncEngine {
         }
       }
 
+      // Advance the cursor only after every change in this page has been
+      // applied. A failed page is retried on the next refresh.
+      this.syncState = changes.syncState;
       hasMore = !changes.includesLastItem;
     }
 
@@ -800,6 +908,7 @@ class SyncEngine {
     this.itemMap = {};
     this.reverseMap = {};
     this._localChangesQueue = [];
+    this.conflicts = {};
     await this._saveState();
     console.log("[SyncEngine] Sync state reset");
   }
@@ -814,6 +923,8 @@ class SyncEngine {
       hasSyncState: !!this.syncState,
       mappedItems: Object.keys(this.itemMap).length,
       pendingLocalChanges: this._localChangesQueue.length,
+      conflicts: Object.keys(this.conflicts),
+      lastError: this.lastError,
       syncing: this._syncing,
     };
   }

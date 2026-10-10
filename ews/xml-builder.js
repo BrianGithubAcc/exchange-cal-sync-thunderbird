@@ -40,19 +40,15 @@ function soapEnvelope(bodyXml, headerXml = "") {
   ].join("\n");
 }
 
-/**
- * Builds the SOAP request for Autodiscover (POX).
- */
-function buildAutodiscoverRequest(emailAddress) {
-  return [
-    '<?xml version="1.0" encoding="utf-8"?>',
-    '<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/outlook/requestschema/2006">',
-    "  <Request>",
-    `    <EMailAddress>${xmlEscape(emailAddress)}</EMailAddress>`,
-    "    <AcceptableResponseSchema>http://schemas.microsoft.com/exchange/autodiscover/outlook/responseschema/2006a</AcceptableResponseSchema>",
-    "  </Request>",
-    "</Autodiscover>",
-  ].join("\n");
+function buildGetCalendarFolderRequest() {
+  return soapEnvelope(`
+    <m:GetFolder>
+      <m:FolderShape><t:BaseShape>Default</t:BaseShape></m:FolderShape>
+      <m:FolderIds>
+        <t:DistinguishedFolderId Id="calendar"/>
+      </m:FolderIds>
+    </m:GetFolder>
+  `);
 }
 
 /**
@@ -102,7 +98,7 @@ function buildFindItemRequest(startDate, endDate) {
  */
 function buildGetItemRequest(itemIds) {
   const idElements = itemIds
-    .map((id) => `<t:ItemId Id="${xmlEscape(id.id)}" ChangeKey="${xmlEscape(id.changeKey)}"/>`)
+    .map((id) => `<t:ItemId Id="${xmlEscape(id.id)}"${id.changeKey ? ` ChangeKey="${xmlEscape(id.changeKey)}"` : ""}/>`)
     .join("\n");
 
   return soapEnvelope(`
@@ -166,6 +162,13 @@ function buildCreateItemRequest(event) {
           <t:End>${xmlEscape(event.end)}</t:End>
           <t:Location>${xmlEscape(event.location || "")}</t:Location>
           <t:IsAllDayEvent>${event.isAllDay ? "true" : "false"}</t:IsAllDayEvent>
+          <t:ReminderIsSet>${event.reminderSet ? "true" : "false"}</t:ReminderIsSet>
+          ${event.reminderSet && event.reminderMinutes != null
+            ? `<t:ReminderMinutesBeforeStart>${xmlEscape(event.reminderMinutes)}</t:ReminderMinutesBeforeStart>`
+            : ""}
+          ${event.sensitivity && event.sensitivity !== "Normal"
+            ? `<t:Sensitivity>${xmlEscape(event.sensitivity)}</t:Sensitivity>`
+            : ""}
           ${
             attendees
               ? `<t:RequiredAttendees>${attendees}</t:RequiredAttendees>`
@@ -223,9 +226,41 @@ function buildUpdateItemRequest(itemId, changeKey, updates) {
       </t:SetItemField>
     `);
   }
+  if (updates.isAllDay !== undefined) {
+    setFields.push(`
+      <t:SetItemField>
+        <t:FieldURI FieldURI="calendar:IsAllDayEvent"/>
+        <t:CalendarItem><t:IsAllDayEvent>${updates.isAllDay ? "true" : "false"}</t:IsAllDayEvent></t:CalendarItem>
+      </t:SetItemField>
+    `);
+  }
+  if (updates.reminderSet !== undefined) {
+    setFields.push(`
+      <t:SetItemField>
+        <t:FieldURI FieldURI="item:ReminderIsSet"/>
+        <t:CalendarItem><t:ReminderIsSet>${updates.reminderSet ? "true" : "false"}</t:ReminderIsSet></t:CalendarItem>
+      </t:SetItemField>
+    `);
+  }
+  if (updates.reminderMinutes !== undefined) {
+    setFields.push(`
+      <t:SetItemField>
+        <t:FieldURI FieldURI="item:ReminderMinutesBeforeStart"/>
+        <t:CalendarItem><t:ReminderMinutesBeforeStart>${xmlEscape(updates.reminderMinutes)}</t:ReminderMinutesBeforeStart></t:CalendarItem>
+      </t:SetItemField>
+    `);
+  }
+  if (updates.sensitivity !== undefined) {
+    setFields.push(`
+      <t:SetItemField>
+        <t:FieldURI FieldURI="item:Sensitivity"/>
+        <t:CalendarItem><t:Sensitivity>${xmlEscape(updates.sensitivity)}</t:Sensitivity></t:CalendarItem>
+      </t:SetItemField>
+    `);
+  }
 
   return soapEnvelope(`
-    <m:UpdateItem ConflictResolution="AutoResolve" SendMeetingInvitationsOrCancellations="SendToNone">
+    <m:UpdateItem ConflictResolution="NeverOverwrite" SendMeetingInvitationsOrCancellations="SendToNone">
       <m:ItemChanges>
         <t:ItemChange>
           <t:ItemId Id="${xmlEscape(itemId)}" ChangeKey="${xmlEscape(changeKey)}"/>

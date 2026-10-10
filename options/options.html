@@ -90,10 +90,6 @@
     .status-badge.connected { background: rgba(16,124,16,0.15); color: var(--success); }
     .status-badge.disconnected { background: rgba(209,52,56,0.15); color: var(--error); }
     .status-badge.error { background: rgba(255,140,0,0.15); color: var(--warning); }
-    .auth-toggle { margin-top: 10px; font-size: 0.85em; }
-    .auth-toggle a { color: var(--primary); cursor: pointer; text-decoration: underline; }
-    .basic-auth-section { display: none; margin-top: 10px; }
-    .basic-auth-section.visible { display: block; }
     .divider {
       display: flex; align-items: center; margin: 10px 0;
       color: var(--text-secondary); font-size: 0.85em;
@@ -142,24 +138,9 @@
       <p style="font-size:0.85em;color:var(--text-secondary)" id="deviceCodeStatus">Waiting for sign-in...</p>
     </div>
 
-    <div class="auth-toggle">
-      <a id="toggleBasicAuth">On-premise Exchange? Use password instead</a>
-    </div>
-
-    <div id="basicAuthSection" class="basic-auth-section">
-      <div class="divider">Basic Auth (on-premise)</div>
-      <label for="newUsername">Username</label>
-      <input type="text" id="newUsername" placeholder="DOMAIN\username">
-      <div class="hint">Leave empty to use email address.</div>
-      <label for="newPassword">Password</label>
-      <input type="password" id="newPassword" placeholder="Password">
-    </div>
-
     <div style="margin-top:10px">
       <label for="newCalName">Calendar Name</label>
       <input type="text" id="newCalName" placeholder="Exchange Calendar">
-      <label for="newEwsUrl">EWS URL (optional)</label>
-      <input type="text" id="newEwsUrl" placeholder="Auto-discovered if empty">
       <label for="newInterval">Sync interval (minutes)</label>
       <input type="number" id="newInterval" value="5" min="1" max="60" style="max-width:100px">
     </div>
@@ -170,26 +151,7 @@
     </div>
   </div>
 
-  <!-- iMIP Calendar Mapping -->
-  <div class="card" style="margin-bottom:12px">
-    <h2>&#128233; Meeting Invitations (iMIP)</h2>
-    <p class="hint">Configure which calendar receives meeting invitations for each mail account. Invitations arriving via Exchange are handled automatically. For other accounts, select a target calendar or "Disabled" to let Thunderbird handle them.</p>
-    <div id="imipAccountMapList" style="margin-bottom:8px">
-      <p class="hint">Loading mail accounts...</p>
-    </div>
-    <div class="btn-group">
-      <button id="btnSaveImip" class="btn-primary btn-sm">Save</button>
-      <span id="imipSaveStatus" style="font-size:0.85em;color:var(--success);display:none">&#10003; Saved</span>
-    </div>
-  </div>
-
-  <!-- Pending Invitations -->
-  <div id="pendingInvitesSection" style="display:none">
-    <h2 style="font-size:1.05em;margin-bottom:8px">&#128233; Pending Meeting Invitations</h2>
-    <div id="pendingInvitesList"></div>
-  </div>
-
-  <footer>Exchange Calendar Sync v2.0.0 &mdash; EWS + OAuth + iMIP + Meeting Response</footer>
+  <footer>Exchange Calendar Sync v2.0.8 &mdash; EWS + OAuth + native Thunderbird Calendar</footer>
   <script src="options.js"></script>
 </body>
 </html>

@@ -5,12 +5,14 @@ console.log("[ExCalSync] background.js loading");
  */
 
 // Depends on: sync/engine.js (SyncEngine, DEFAULT_SYNC_INTERVAL_MINUTES)
-// Depends on: sync/imip.js (parseICalendar, isCalendarInvite, imipGetDomain)
 // Depends on: ews/client.js (EwsClient)
 
 var ALARM_PREFIX = "excalsync-";
-var MS_CLIENT_ID = "d3590ed6-52b3-4102-aeff-aad2292ab01c";
-var EWS_SCOPE = "https://outlook.office365.com/EWS.AccessAsUser.All offline_access";
+// Access tokens are deliberately process-memory-only. Refresh tokens are
+// stored by the privileged SecureStorage Experiment in Thunderbird's Login
+// Manager rather than browser.storage.local.
+var oauthTokens = Object.create(null);
+var oauthPollCancelled = Object.create(null);
 
 // Map of accountId -> { engine, lastResult, lastError }
 var accounts = {};
@@ -109,52 +111,90 @@ function acctKey(accountId, key) {
   return "acct_" + accountId + "_" + key;
 }
 
+function secureTokenKey(accountId) {
+  return "oauth-refresh-" + accountId;
+}
+
+function oauthResponseBody(response) {
+  if (!response || typeof response.body !== "string") return {};
+  try {
+    return response.body ? JSON.parse(response.body) : {};
+  } catch (e) {
+    return { error: "invalid_response" };
+  }
+}
+
+async function getRefreshToken(accountId) {
+  var result = await browser.SecureStorage.get(secureTokenKey(accountId));
+  return result && result.found ? result.value : null;
+}
+
+async function setRefreshToken(accountId, token) {
+  if (token) {
+    await browser.SecureStorage.set(secureTokenKey(accountId), token);
+  } else {
+    await browser.SecureStorage.remove(secureTokenKey(accountId));
+  }
+}
+
+async function clearOAuthCredentials(accountId) {
+  delete oauthTokens[accountId];
+  await setRefreshToken(accountId, null);
+}
+
+async function migrateLegacyOAuthStorage() {
+  const all = await browser.storage.local.get(null);
+  const removeKeys = [];
+  for (const key of Object.keys(all)) {
+    const refreshMatch = key.match(/^acct_(.+)_oauthRefreshToken$/);
+    if (refreshMatch && all[key]) {
+      await setRefreshToken(refreshMatch[1], all[key]);
+      removeKeys.push(key);
+      continue;
+    }
+    if (/^acct_.+_oauthToken$/.test(key)) {
+      // Access tokens from older releases are intentionally not migrated.
+      removeKeys.push(key);
+      continue;
+    }
+    if (/^acct_.+_(username|password)$/.test(key)) {
+      // Remove credentials written by the old Basic Auth implementation.
+      removeKeys.push(key);
+    }
+  }
+  if (removeKeys.length > 0) {
+    await browser.storage.local.remove(removeKeys);
+  }
+}
+
 /**
  * Refresh an OAuth access token using the stored refresh token.
  * Returns the new access token, or null if refresh failed.
  */
 async function refreshOAuthToken(accountId) {
-  var refreshKey = acctKey(accountId, "oauthRefreshToken");
-  var data = await browser.storage.local.get([refreshKey]);
-  var refreshToken = data[refreshKey];
+  var refreshToken = await getRefreshToken(accountId);
 
   if (!refreshToken) {
-    console.log("[ExCalSync] No refresh token for", accountId);
     return null;
   }
 
-  console.log("[ExCalSync] Refreshing OAuth token for", accountId);
   try {
-    var response = await fetch(
-      "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: "client_id=" + encodeURIComponent(MS_CLIENT_ID) +
-              "&grant_type=refresh_token" +
-              "&refresh_token=" + encodeURIComponent(refreshToken) +
-              "&scope=" + encodeURIComponent(EWS_SCOPE),
-      }
-    );
+    var response = await browser.SecureStorage.refreshAccessToken(refreshToken);
 
-    if (!response.ok) {
-      var errBody = await response.json().catch(function () { return {}; });
+    if (response.status < 200 || response.status >= 300) {
+      var errBody = oauthResponseBody(response);
       console.error("[ExCalSync] Token refresh failed:", response.status, errBody.error_description || errBody.error || "");
       return null;
     }
 
-    var tokenData = await response.json();
-    var store = {};
-    store[acctKey(accountId, "oauthToken")] = tokenData.access_token;
+    var tokenData = oauthResponseBody(response);
+    if (!tokenData.access_token) return null;
+    oauthTokens[accountId] = tokenData.access_token;
     if (tokenData.refresh_token) {
-      store[acctKey(accountId, "oauthRefreshToken")] = tokenData.refresh_token;
+      await setRefreshToken(accountId, tokenData.refresh_token);
     }
-    await browser.storage.local.set(store);
-
-    console.log("[ExCalSync] OAuth token refreshed for", accountId);
     return tokenData.access_token;
   } catch (e) {
-    console.error("[ExCalSync] Token refresh error for", accountId, ":", e.message);
     return null;
   }
 }
@@ -179,9 +219,9 @@ async function startAccountSync(account) {
       // Always try to refresh the token first to avoid 401s
       var freshToken = await refreshOAuthToken(id);
       if (!freshToken) {
-        // Refresh failed, fall back to stored token (may still work if recent)
-        var tokenData = await browser.storage.local.get([acctKey(id, "oauthToken")]);
-        freshToken = tokenData[acctKey(id, "oauthToken")];
+        // Access tokens are memory-only. A refresh token is required after a
+        // Thunderbird restart or when the in-memory token has expired.
+        freshToken = oauthTokens[id];
       }
       if (!freshToken) {
         console.log("[ExCalSync] No OAuth token for", id);
@@ -192,19 +232,7 @@ async function startAccountSync(account) {
         token: freshToken,
       };
     } else {
-      var credData = await browser.storage.local.get([
-        acctKey(id, "username"),
-        acctKey(id, "password"),
-      ]);
-      config.credentials = {
-        type: "basic",
-        username: credData[acctKey(id, "username")] || account.email,
-        password: credData[acctKey(id, "password")],
-      };
-      if (!config.credentials.password) {
-        console.log("[ExCalSync] No password for", id);
-        return { success: false, reason: "no_password" };
-      }
+      return { success: false, reason: "oauth_required" };
     }
 
     // Load saved sync state for this account
@@ -213,6 +241,8 @@ async function startAccountSync(account) {
       acctKey(id, "itemMap"),
       acctKey(id, "reverseMap"),
       acctKey(id, "calendarId"),
+      acctKey(id, "localChangesQueue"),
+      acctKey(id, "conflicts"),
     ]);
 
     var engine = new SyncEngine();
@@ -221,6 +251,8 @@ async function startAccountSync(account) {
     engine.itemMap = stateData[acctKey(id, "itemMap")] || {};
     engine.reverseMap = stateData[acctKey(id, "reverseMap")] || {};
     engine.calendarId = stateData[acctKey(id, "calendarId")] || null;
+    engine._localChangesQueue = stateData[acctKey(id, "localChangesQueue")] || [];
+    engine.conflicts = stateData[acctKey(id, "conflicts")] || {};
 
     // Override _saveState to use account-scoped keys
     engine._saveState = async function () {
@@ -229,6 +261,8 @@ async function startAccountSync(account) {
       stateObj[acctKey(id, "itemMap")] = this.itemMap;
       stateObj[acctKey(id, "reverseMap")] = this.reverseMap;
       stateObj[acctKey(id, "calendarId")] = this.calendarId;
+      stateObj[acctKey(id, "localChangesQueue")] = this._localChangesQueue;
+      stateObj[acctKey(id, "conflicts")] = this.conflicts;
       await browser.storage.local.set(stateObj);
     };
 
@@ -364,22 +398,23 @@ browser.runtime.onMessage.addListener(async function (message) {
     }
 
     case "startDeviceCode": {
+      if (!message.accountId || typeof message.accountId !== "string") {
+        return { success: false, error: "Missing temporary account ID" };
+      }
+      oauthPollCancelled[message.accountId] = false;
       try {
-        var deviceResponse = await fetch(
-          "https://login.microsoftonline.com/organizations/oauth2/v2.0/devicecode",
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body: "client_id=" + encodeURIComponent(MS_CLIENT_ID) +
-                  "&scope=" + encodeURIComponent(EWS_SCOPE),
-          }
-        );
+        var deviceResponse = await browser.SecureStorage.startDeviceCode();
 
-        if (!deviceResponse.ok) {
-          return { success: false, error: "Failed to start sign-in: " + deviceResponse.status };
+        if (deviceResponse.status < 200 || deviceResponse.status >= 300) {
+          var startError = oauthResponseBody(deviceResponse);
+          return {
+            success: false,
+            error: "Failed to start sign-in: " + deviceResponse.status +
+              (startError.error_description ? " (" + startError.error_description + ")" : ""),
+          };
         }
 
-        var deviceData = await deviceResponse.json();
+        var deviceData = oauthResponseBody(deviceResponse);
         return {
           success: true,
           userCode: deviceData.user_code,
@@ -399,74 +434,94 @@ browser.runtime.onMessage.addListener(async function (message) {
 
       try {
         while (Date.now() < expiresAt) {
+          if (oauthPollCancelled[message.accountId]) {
+            await clearOAuthCredentials(message.accountId);
+            return { success: false, error: "Sign-in cancelled." };
+          }
           await new Promise(function (r) { setTimeout(r, pollInterval); });
+          if (oauthPollCancelled[message.accountId]) {
+            await clearOAuthCredentials(message.accountId);
+            return { success: false, error: "Sign-in cancelled." };
+          }
 
-          var tokenResponse = await fetch(
-            "https://login.microsoftonline.com/organizations/oauth2/v2.0/token",
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/x-www-form-urlencoded" },
-              body: "client_id=" + encodeURIComponent(MS_CLIENT_ID) +
-                    "&grant_type=urn:ietf:params:oauth:grant-type:device_code" +
-                    "&device_code=" + encodeURIComponent(message.deviceCode),
+          var tokenResponse = await browser.SecureStorage.pollDeviceCode(message.deviceCode);
+
+          if (tokenResponse.status >= 200 && tokenResponse.status < 300) {
+            var tokenData = oauthResponseBody(tokenResponse);
+
+            // Keep access tokens in memory and put only the refresh token in
+            // Thunderbird's password manager.
+            oauthTokens[message.accountId] = tokenData.access_token;
+            if (tokenData.refresh_token) {
+              await setRefreshToken(message.accountId, tokenData.refresh_token);
             }
-          );
 
-          if (tokenResponse.ok) {
-            var tokenData = await tokenResponse.json();
-
-            // Store token scoped to the account being set up
-            var tokenStore = {};
-            tokenStore[acctKey(message.accountId, "oauthToken")] = tokenData.access_token;
-            tokenStore[acctKey(message.accountId, "oauthRefreshToken")] = tokenData.refresh_token || "";
-            await browser.storage.local.set(tokenStore);
-
+            delete oauthPollCancelled[message.accountId];
             return { success: true };
           }
 
-          var errorBody = await tokenResponse.json().catch(function () { return {}; });
+          var errorBody = oauthResponseBody(tokenResponse);
           var errorCode = errorBody.error || "";
 
           if (errorCode === "authorization_pending") continue;
           else if (errorCode === "slow_down") { pollInterval += 5000; continue; }
-          else if (errorCode === "authorization_declined") return { success: false, error: "Sign-in declined." };
-          else if (errorCode === "expired_token") return { success: false, error: "Sign-in timed out." };
+          else if (errorCode === "authorization_declined") {
+            await clearOAuthCredentials(message.accountId);
+            return { success: false, error: "Sign-in declined." };
+          }
+          else if (errorCode === "expired_token") {
+            await clearOAuthCredentials(message.accountId);
+            return { success: false, error: "Sign-in timed out." };
+          }
           else return { success: false, error: errorBody.error_description || errorCode };
         }
+        await clearOAuthCredentials(message.accountId);
         return { success: false, error: "Sign-in timed out." };
       } catch (e) {
+        await clearOAuthCredentials(message.accountId).catch(function () {});
         return { success: false, error: e.message };
+      } finally {
+        delete oauthPollCancelled[message.accountId];
       }
+    }
+
+    case "cancelDeviceCode": {
+      if (message.accountId) {
+        oauthPollCancelled[message.accountId] = true;
+        await clearOAuthCredentials(message.accountId);
+      }
+      return { success: true };
     }
 
     case "addAccount": {
       var acctList = await loadAccounts();
       var newId = generateId();
+      if (message.authType && message.authType !== "oauth") {
+        return { success: false, error: "Only OAuth sign-in is supported." };
+      }
+      if (!message.pendingAccountId || !oauthTokens[message.pendingAccountId]) {
+        return { success: false, error: "Complete Microsoft sign-in first." };
+      }
       var newAccount = {
         id: newId,
         email: message.email,
-        authType: message.authType || "oauth",
+        authType: "oauth",
         calendarName: message.calendarName || "Exchange (" + message.email + ")",
-        ewsUrl: message.ewsUrl || "",
+        ewsUrl: "",
         syncIntervalMinutes: message.syncIntervalMinutes || DEFAULT_SYNC_INTERVAL_MINUTES,
       };
 
-      if (message.authType === "basic") {
-        var credStore = {};
-        credStore[acctKey(newId, "username")] = message.username || message.email;
-        credStore[acctKey(newId, "password")] = message.password;
-        await browser.storage.local.set(credStore);
-      } else if (message.authType === "oauth" && message.pendingAccountId) {
-        // Move token from pending temp ID to the real account ID
-        var pendingTokenKey = acctKey(message.pendingAccountId, "oauthToken");
-        var pendingRefreshKey = acctKey(message.pendingAccountId, "oauthRefreshToken");
-        var pendingData = await browser.storage.local.get([pendingTokenKey, pendingRefreshKey]);
-
-        var moveStore = {};
-        moveStore[acctKey(newId, "oauthToken")] = pendingData[pendingTokenKey] || "";
-        moveStore[acctKey(newId, "oauthRefreshToken")] = pendingData[pendingRefreshKey] || "";
-        await browser.storage.local.set(moveStore);
-        await browser.storage.local.remove([pendingTokenKey, pendingRefreshKey]);
+      if (message.pendingAccountId) {
+        // Move the in-memory access token and password-manager refresh token
+        // from the temporary setup ID to the persistent account ID.
+        if (oauthTokens[message.pendingAccountId]) {
+          oauthTokens[newId] = oauthTokens[message.pendingAccountId];
+        }
+        var pendingRefresh = await getRefreshToken(message.pendingAccountId);
+        if (pendingRefresh) {
+          await setRefreshToken(newId, pendingRefresh);
+        }
+        await clearOAuthCredentials(message.pendingAccountId);
       }
 
       acctList.push(newAccount);
@@ -479,6 +534,7 @@ browser.runtime.onMessage.addListener(async function (message) {
 
     case "removeAccount": {
       await stopAccountSync(message.accountId);
+      await clearOAuthCredentials(message.accountId);
 
       // Remove calendar if requested
       var acctState = accounts[message.accountId];
@@ -492,14 +548,14 @@ browser.runtime.onMessage.addListener(async function (message) {
 
       // Clean up storage
       var keysToRemove = [
-        acctKey(message.accountId, "oauthToken"),
-        acctKey(message.accountId, "oauthRefreshToken"),
         acctKey(message.accountId, "username"),
         acctKey(message.accountId, "password"),
         acctKey(message.accountId, "syncState"),
         acctKey(message.accountId, "itemMap"),
         acctKey(message.accountId, "reverseMap"),
         acctKey(message.accountId, "calendarId"),
+        acctKey(message.accountId, "localChangesQueue"),
+        acctKey(message.accountId, "conflicts"),
       ];
       await browser.storage.local.remove(keysToRemove);
 
@@ -567,648 +623,7 @@ browser.runtime.onMessage.addListener(async function (message) {
     }
 
     default:
-      if (message.action === "getPendingInvites") {
-        return await loadPendingInvites();
-      }
-      if (message.action === "acceptInvite") {
-        await acceptPendingInvite(message.notifId, message.calendarId);
-        return { success: true };
-      }
-      if (message.action === "dismissInvite") {
-        var pending = await loadPendingInvites();
-        delete pending[message.notifId];
-        await savePendingInvites(pending);
-        return { success: true };
-      }
-      if (message.action === "getAllCalendars") {
-        return await browser.CalendarAPI.getCalendars();
-      }
-      if (message.action === "getMailAccounts") {
-        try {
-          var mailAccounts = await browser.accounts.list();
-          return mailAccounts.map(function (a) {
-            var email = "";
-            if (a.identities && a.identities.length > 0) {
-              email = a.identities[0].email || "";
-            }
-            return { id: a.id, name: a.name || email, email: email, type: a.type };
-          }).filter(function (a) { return a.email; });
-        } catch (e) {
-          console.error("[ExCalSync] getMailAccounts error:", e);
-          return [];
-        }
-      }
-      if (message.action === "getImipAccountMap") {
-        var mapStore = await browser.storage.local.get([IMIP_ACCOUNT_MAP_KEY]);
-        return mapStore[IMIP_ACCOUNT_MAP_KEY] || {};
-      }
-      if (message.action === "setImipAccountMap") {
-        var mapObj = {};
-        mapObj[IMIP_ACCOUNT_MAP_KEY] = message.accountMap || {};
-        await browser.storage.local.set(mapObj);
-        console.log("[ExCalSync] iMIP account map saved:", JSON.stringify(message.accountMap));
-        return { success: true };
-      }
-      if (message.action === "checkMeetingMessage") {
-        return await checkMeetingMessage(message.messageId, message.subject, message.author);
-      }
-      if (message.action === "respondToMeeting") {
-        return await respondToMeetingAction(message.responseType, message.itemId, message.changeKey, message.accountId, message.messageId);
-      }
       return { error: "Unknown action: " + message.action };
-  }
-});
-
-/**
- * =============================================
- * Meeting Response (Accept/Tentative/Decline)
- * =============================================
- * Detects meeting invite emails and responds via EWS.
- */
-
-/**
- * Check if a displayed message is a meeting invite, and find the corresponding
- * Exchange calendar item to enable Accept/Tentative/Decline responses.
- */
-async function checkMeetingMessage(messageId, subject, author) {
-  try {
-    // First: check if message has a text/calendar part (definitive meeting invite)
-    var isMeetingByContent = false;
-    var parsedInvite = null;
-
-    try {
-      var inlineParts = await browser.messages.listInlineTextParts(messageId);
-      for (var part of inlineParts) {
-        if (isCalendarInvite(part.contentType)) {
-          isMeetingByContent = true;
-          parsedInvite = parseICalendar(part.content);
-          break;
-        }
-      }
-    } catch (e) { /* may fail for some messages */ }
-
-    if (!isMeetingByContent) {
-      try {
-        var attachments = await browser.messages.listAttachments(messageId);
-        for (var att of attachments) {
-          if (isCalendarInvite(att.contentType) || (att.name && att.name.toLowerCase().endsWith(".ics"))) {
-            isMeetingByContent = true;
-            var file = await browser.messages.getAttachmentFile(messageId, att.partName);
-            var content = await file.text();
-            parsedInvite = parseICalendar(content);
-            break;
-          }
-        }
-      } catch (e) { /* may fail */ }
-    }
-
-    // Second: check body for OWA calendar links (Exchange sends these instead of .ics)
-    var hasOwaCalendarLink = false;
-    if (!isMeetingByContent) {
-      try {
-        var inlineTexts = await browser.messages.listInlineTextParts(messageId);
-        for (var tp of inlineTexts) {
-          if (tp.content && tp.content.indexOf("calendar/item") !== -1) {
-            hasOwaCalendarLink = true;
-            break;
-          }
-          if (tp.content && tp.content.indexOf("itemid=") !== -1 && tp.content.indexOf("outlook.office365.com") !== -1) {
-            hasOwaCalendarLink = true;
-            break;
-          }
-        }
-      } catch (e) { /* may fail */ }
-    }
-
-    // Third: check subject patterns common for meeting invites
-    var meetingSubjectPatterns = /^(accepted|tentative|declined|cancelled|updated|invitation):/i;
-    var hasMeetingSubject = subject && meetingSubjectPatterns.test(subject.trim());
-
-    if (!isMeetingByContent && !hasOwaCalendarLink && !hasMeetingSubject) {
-      return { isMeeting: false };
-    }
-
-    // Find the corresponding Exchange calendar item
-    var acctList = await loadAccounts();
-    for (var acct of acctList) {
-      var acctState = accounts[acct.id];
-      if (!acctState || !acctState.engine || !acctState.engine.ewsClient) continue;
-
-      // Search by subject in a wide date range
-      var searchSubject = subject || "";
-      // Strip common prefixes
-      searchSubject = searchSubject.replace(/^(Re:|Fwd:|Accepted:|Tentative:|Declined:|Cancelled:|Updated:|Invitation:)\s*/gi, "").trim();
-
-      if (!searchSubject) continue;
-
-      try {
-        var now = new Date();
-        var searchStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000); // 1 week ago
-        var searchEnd = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000); // 90 days forward
-
-        var found = await acctState.engine.ewsClient.findItemBySubject(searchSubject, searchStart, searchEnd);
-
-        if (found.length > 0) {
-          var item = found[0]; // Best match (subject search)
-          return {
-            isMeeting: true,
-            subject: item.subject || searchSubject,
-            start: item.start || (parsedInvite ? parsedInvite.dtstart : null),
-            end: item.end || (parsedInvite ? parsedInvite.dtend : null),
-            location: item.location || (parsedInvite ? parsedInvite.location : null),
-            organizer: item.organizer || (parsedInvite ? (parsedInvite.organizerName || parsedInvite.organizer) : null) || author,
-            itemId: item.id,
-            changeKey: item.changeKey,
-            accountId: acct.id,
-            messageId: messageId,
-          };
-        }
-      } catch (e) {
-        console.error("[ExCalSync] Meeting search failed for account", acct.id, ":", e.message);
-      }
-    }
-
-    // If we know it's a meeting but can't find the item (maybe not synced yet)
-    if (isMeetingByContent || hasOwaCalendarLink) {
-      return {
-        isMeeting: true,
-        subject: (parsedInvite ? parsedInvite.summary : null) || subject || "Meeting",
-        start: parsedInvite ? parsedInvite.dtstart : null,
-        end: parsedInvite ? parsedInvite.dtend : null,
-        location: parsedInvite ? parsedInvite.location : null,
-        organizer: parsedInvite ? (parsedInvite.organizerName || parsedInvite.organizer) : author,
-        itemId: null,
-        changeKey: null,
-        accountId: null,
-        messageId: messageId,
-      };
-    }
-
-    return { isMeeting: false };
-  } catch (e) {
-    console.error("[ExCalSync] checkMeetingMessage error:", e);
-    return { isMeeting: false };
-  }
-}
-
-/**
- * Send a meeting response (Accept/Tentative/Decline) via EWS.
- */
-async function respondToMeetingAction(responseType, itemId, changeKey, accountId, messageId) {
-  try {
-    if (!itemId || !changeKey) {
-      // Try to find the item first by triggering a sync
-      if (accountId) {
-        var acctState = accounts[accountId];
-        if (acctState && acctState.engine) {
-          await acctState.engine.incrementalSync();
-        }
-      }
-      return { success: false, error: "Meeting not found on Exchange. Try syncing first, then respond again." };
-    }
-
-    if (!accountId) {
-      return { success: false, error: "No Exchange account found for this meeting." };
-    }
-
-    var acctState = accounts[accountId];
-    if (!acctState || !acctState.engine || !acctState.engine.ewsClient) {
-      return { success: false, error: "Exchange account not connected." };
-    }
-
-    // Send the response
-    await acctState.engine.ewsClient.respondToMeeting(itemId, changeKey, responseType);
-    console.log("[ExCalSync] Meeting response sent:", responseType, "for item:", itemId.substring(0, 20) + "...");
-
-    // Trigger a sync to update local state
-    try {
-      await acctState.engine.incrementalSync();
-    } catch (e) { /* non-critical */ }
-
-    // Mark the email as read
-    if (messageId) {
-      try {
-        await browser.messages.update(messageId, { read: true });
-      } catch (e) { /* may fail */ }
-    }
-
-    return { success: true };
-  } catch (e) {
-    console.error("[ExCalSync] respondToMeeting error:", e);
-    return { success: false, error: e.message };
-  }
-}
-
-/**
- * =============================================
- * Meeting Request (iMIP) Processing
- * =============================================
- * Monitors incoming emails for text/calendar parts (meeting invitations),
- * parses them, and adds/updates/removes events in the appropriate calendar.
- */
-
-var MEETING_UID_MAP_KEY = "meetingUidMap";
-var PENDING_INVITES_KEY = "pendingInvites";
-var IMIP_ACCOUNT_MAP_KEY = "imipAccountCalendarMap";
-
-/**
- * Load the meeting UID map from storage.
- * Maps iCalendar UID -> { calendarId, localItemId, sequence }
- */
-async function loadMeetingUidMap() {
-  var data = await browser.storage.local.get([MEETING_UID_MAP_KEY]);
-  return data[MEETING_UID_MAP_KEY] || {};
-}
-
-async function saveMeetingUidMap(map) {
-  var obj = {};
-  obj[MEETING_UID_MAP_KEY] = map;
-  await browser.storage.local.set(obj);
-}
-
-/**
- * Load/save pending invitations (for notification-based accept flow).
- */
-async function loadPendingInvites() {
-  var data = await browser.storage.local.get([PENDING_INVITES_KEY]);
-  return data[PENDING_INVITES_KEY] || {};
-}
-
-async function savePendingInvites(invites) {
-  var obj = {};
-  obj[PENDING_INVITES_KEY] = invites;
-  await browser.storage.local.set(obj);
-}
-
-/**
- * Find target calendars for a meeting based on attendee emails.
- * Returns an array of { calendarId, accountId, isExchange }.
- * Matches our accounts against the ATTENDEE list, skipping the organizer.
- */
-async function findTargetCalendars(parsed, receivingAccountId) {
-  var acctList = await loadAccounts();
-  var targets = [];
-
-  // Build set of attendee emails
-  var attendeeEmails = new Set();
-  if (parsed.attendees) {
-    for (var att of parsed.attendees) {
-      if (att.email) attendeeEmails.add(att.email.toLowerCase());
-    }
-  }
-
-  var organizerEmail = parsed.organizer ? parsed.organizer.toLowerCase() : "";
-
-  // 1) Match our accounts that appear as attendees (not organizer)
-  for (var acct of acctList) {
-    var acctEmail = acct.email.toLowerCase();
-    if (acctEmail === organizerEmail) continue; // organizer already has it via sync
-    if (attendeeEmails.has(acctEmail)) {
-      var state = accounts[acct.id];
-      if (state && state.engine && state.engine.calendarId) {
-        targets.push({ calendarId: state.engine.calendarId, accountId: acct.id, isExchange: true });
-      }
-    }
-  }
-  if (targets.length > 0) return targets;
-
-  // 2) Fallback: domain match, but still skip organizer's own account
-  var orgDomain = imipGetDomain(organizerEmail);
-  for (var acct of acctList) {
-    var acctEmail = acct.email.toLowerCase();
-    if (acctEmail === organizerEmail) continue;
-    var acctDomain = imipGetDomain(acctEmail);
-    if (acctDomain && orgDomain && acctDomain === orgDomain) {
-      var state = accounts[acct.id];
-      if (state && state.engine && state.engine.calendarId) {
-        targets.push({ calendarId: state.engine.calendarId, accountId: acct.id, isExchange: true });
-      }
-    }
-  }
-  if (targets.length > 0) return targets;
-
-  // 3) Single account fallback (only if it's not the organizer)
-  if (acctList.length === 1) {
-    var singleAcct = acctList[0];
-    if (singleAcct.email.toLowerCase() !== organizerEmail) {
-      var singleState = accounts[singleAcct.id];
-      if (singleState && singleState.engine && singleState.engine.calendarId) {
-        return [{ calendarId: singleState.engine.calendarId, accountId: singleAcct.id, isExchange: true }];
-      }
-    }
-  }
-
-  // 4) No Exchange match — look up per-account calendar mapping
-  var mapData = await browser.storage.local.get([IMIP_ACCOUNT_MAP_KEY]);
-  var accountMap = mapData[IMIP_ACCOUNT_MAP_KEY] || {};
-
-  if (receivingAccountId && accountMap[receivingAccountId]) {
-    var mappedCalId = accountMap[receivingAccountId];
-    if (mappedCalId === "disabled") {
-      console.log("[ExCalSync iMIP] iMIP disabled for mail account", receivingAccountId);
-      return [];
-    }
-    // Verify the mapped calendar still exists
-    try {
-      var calendars = await browser.CalendarAPI.getCalendars();
-      var exists = calendars.some(function (c) { return c.id === mappedCalId; });
-      if (exists) {
-        console.log("[ExCalSync iMIP] Using mapped calendar for account", receivingAccountId);
-        return [{ calendarId: mappedCalId, accountId: null, isExchange: false }];
-      }
-    } catch (e) { /* fall through */ }
-    console.log("[ExCalSync iMIP] Mapped calendar not found for account", receivingAccountId);
-  }
-
-  // No mapping configured for this account — let Thunderbird handle it
-  console.log("[ExCalSync iMIP] No iMIP mapping for mail account", receivingAccountId || "(unknown)", ", skipping");
-  return [];
-}
-
-/**
- * Check if a meeting UID already exists in any synced account's item map.
- * EWS-synced items use UIDs like "ews-<hash>@exchange-cal-sync".
- */
-function isUidInSyncMap(uid) {
-  // The UID in the iCalendar invite is the original Exchange/Outlook UID.
-  // Our EWS sync generates synthetic UIDs from Exchange ItemIds.
-  // We can't match by UID directly, so we rely on the meetingUidMap instead.
-  return false;
-}
-
-/**
- * Handle a parsed meeting REQUEST.
- */
-async function handleMeetingRequest(parsed, messageId, target) {
-  console.log("[ExCalSync iMIP] Meeting REQUEST:", parsed.summary, "UID:", parsed.uid,
-    "-> account:", target.accountId || "fallback");
-
-  if (target.isExchange) {
-    // For Exchange-matched accounts, trigger an incremental sync
-    // The Exchange server will already have the meeting invitation
-    var acctState = accounts[target.accountId];
-    if (acctState && acctState.engine) {
-      console.log("[ExCalSync iMIP] Exchange account matched, triggering sync for account:", target.accountId);
-      try {
-        await acctState.engine.incrementalSync();
-        await browser.notifications.create("imip-synced-" + Date.now(), {
-          type: "basic",
-          title: "Meeting synced",
-          message: (parsed.summary || "Meeting") + "\n" + (parsed.dtstart || ""),
-          iconUrl: "icons/icon-64.svg",
-        });
-      } catch (e) {
-        console.error("[ExCalSync iMIP] Sync after meeting request failed:", e);
-      }
-    }
-    return;
-  }
-
-  // Non-Exchange calendar — check sequence and prompt user
-  var uidMap = await loadMeetingUidMap();
-  var existing = uidMap[parsed.uid];
-  if (existing && existing.sequence >= parsed.sequence) {
-    console.log("[ExCalSync iMIP] Already have this meeting (seq " + existing.sequence + "), skipping");
-    return;
-  }
-
-  var notifId = "imip-request-" + Date.now();
-  var timeStr = parsed.dtstart || "";
-  if (parsed.dtend) timeStr += " - " + parsed.dtend;
-
-  var pendingInvites = await loadPendingInvites();
-  pendingInvites[notifId] = {
-    parsed: parsed,
-    calendarId: target.calendarId,
-    messageId: messageId,
-    timestamp: Date.now(),
-  };
-  await savePendingInvites(pendingInvites);
-
-  await browser.notifications.create(notifId, {
-    type: "basic",
-    title: "Meeting Invitation: " + (parsed.summary || "No Subject"),
-    message: (parsed.organizerName || parsed.organizer || "Unknown") + "\n" +
-             timeStr + (parsed.location ? "\n" + parsed.location : "") +
-             "\n\nClick to accept.",
-    iconUrl: "icons/icon-64.svg",
-  });
-}
-
-/**
- * Handle a parsed meeting CANCEL.
- */
-async function handleMeetingCancel(parsed, messageId, target) {
-  console.log("[ExCalSync iMIP] Meeting CANCEL:", parsed.summary, "UID:", parsed.uid,
-    "-> account:", target.accountId || "fallback");
-
-  if (target.isExchange) {
-    var acctState = accounts[target.accountId];
-    if (acctState && acctState.engine) {
-      console.log("[ExCalSync iMIP] Exchange account matched for cancel, triggering sync");
-      try {
-        await acctState.engine.incrementalSync();
-      } catch (e) {
-        console.error("[ExCalSync iMIP] Sync after cancel failed:", e);
-      }
-    }
-    await browser.notifications.create("imip-cancel-" + Date.now(), {
-      type: "basic",
-      title: "Meeting cancelled",
-      message: (parsed.summary || "Meeting") + " has been cancelled.",
-      iconUrl: "icons/icon-64.svg",
-    });
-    return;
-  }
-
-  // Non-Exchange: look up in meetingUidMap and delete
-  var uidMap = await loadMeetingUidMap();
-  var existing = uidMap[parsed.uid];
-  if (existing) {
-    try {
-      await browser.CalendarAPI.deleteItem(existing.calendarId, existing.localItemId);
-      console.log("[ExCalSync iMIP] Deleted cancelled meeting from calendar");
-    } catch (e) {
-      console.error("[ExCalSync iMIP] Failed to delete cancelled meeting:", e);
-    }
-    delete uidMap[parsed.uid];
-    await saveMeetingUidMap(uidMap);
-  }
-
-  await browser.notifications.create("imip-cancel-" + Date.now(), {
-    type: "basic",
-    title: "Meeting cancelled",
-    message: (parsed.summary || "Meeting") + " has been cancelled.",
-    iconUrl: "icons/icon-64.svg",
-  });
-}
-
-/**
- * Handle a meeting update (REQUEST with higher sequence).
- */
-async function handleMeetingUpdate(parsed, messageId, target) {
-  console.log("[ExCalSync iMIP] Meeting UPDATE:", parsed.summary, "UID:", parsed.uid, "seq:", parsed.sequence,
-    "-> account:", target.accountId || "fallback");
-
-  if (target.isExchange) {
-    var acctState = accounts[target.accountId];
-    if (acctState && acctState.engine) {
-      try { await acctState.engine.incrementalSync(); } catch (e) { /* logged elsewhere */ }
-    }
-    return;
-  }
-
-  var uidMap = await loadMeetingUidMap();
-  var existing = uidMap[parsed.uid];
-
-  if (existing) {
-    try {
-      await browser.CalendarAPI.updateItem(existing.calendarId, existing.localItemId, parsed.rawIcs);
-      uidMap[parsed.uid].sequence = parsed.sequence;
-      await saveMeetingUidMap(uidMap);
-      console.log("[ExCalSync iMIP] Updated meeting in calendar");
-
-      await browser.notifications.create("imip-update-" + Date.now(), {
-        type: "basic",
-        title: "Meeting updated",
-        message: (parsed.summary || "Meeting") + "\n" + (parsed.dtstart || ""),
-        iconUrl: "icons/icon-64.svg",
-      });
-    } catch (e) {
-      console.error("[ExCalSync iMIP] Failed to update meeting:", e);
-    }
-  } else {
-    await handleMeetingRequest(parsed, messageId, target);
-  }
-}
-
-/**
- * Accept a pending meeting invitation (called from notification click or options page).
- */
-async function acceptPendingInvite(notifId, overrideCalendarId) {
-  var pendingInvites = await loadPendingInvites();
-  var invite = pendingInvites[notifId];
-  if (!invite) {
-    console.log("[ExCalSync iMIP] No pending invite found for:", notifId);
-    return;
-  }
-
-  var targetCalId = overrideCalendarId || invite.calendarId;
-
-  try {
-    var result = await browser.CalendarAPI.addItem(targetCalId, invite.parsed.rawIcs);
-    console.log("[ExCalSync iMIP] Added meeting to calendar", targetCalId, "localId:", result.id);
-
-    // Update UID map
-    var uidMap = await loadMeetingUidMap();
-    uidMap[invite.parsed.uid] = {
-      calendarId: targetCalId,
-      localItemId: result.id,
-      sequence: invite.parsed.sequence,
-    };
-    await saveMeetingUidMap(uidMap);
-
-    // Mark email as read
-    if (invite.messageId) {
-      try {
-        await browser.messages.update(invite.messageId, { read: true });
-      } catch (e) { /* message may have been moved/deleted */ }
-    }
-  } catch (e) {
-    console.error("[ExCalSync iMIP] Failed to accept invitation:", e);
-  }
-
-  delete pendingInvites[notifId];
-  await savePendingInvites(pendingInvites);
-}
-
-/**
- * Process a single message for iCalendar content.
- */
-async function processMessageForInvites(messageId, receivingAccountId) {
-  try {
-    // Check inline text parts for text/calendar
-    var inlineParts = await browser.messages.listInlineTextParts(messageId);
-    for (var part of inlineParts) {
-      if (isCalendarInvite(part.contentType)) {
-        var parsed = parseICalendar(part.content);
-        if (parsed) {
-          await routeMeetingAction(parsed, messageId, receivingAccountId);
-          return; // One invite per message is typical
-        }
-      }
-    }
-
-    // Check attachments for .ics files
-    var attachments = await browser.messages.listAttachments(messageId);
-    for (var att of attachments) {
-      if (isCalendarInvite(att.contentType) || (att.name && att.name.toLowerCase().endsWith(".ics"))) {
-        var file = await browser.messages.getAttachmentFile(messageId, att.partName);
-        var content = await file.text();
-        var parsed = parseICalendar(content);
-        if (parsed) {
-          await routeMeetingAction(parsed, messageId, receivingAccountId);
-          return;
-        }
-      }
-    }
-  } catch (e) {
-    console.error("[ExCalSync iMIP] Error processing message", messageId, ":", e);
-  }
-}
-
-/**
- * Route a parsed iCalendar to the appropriate handler based on METHOD.
- */
-async function routeMeetingAction(parsed, messageId, receivingAccountId) {
-  var targets = await findTargetCalendars(parsed, receivingAccountId);
-  if (targets.length === 0) {
-    console.log("[ExCalSync iMIP] No target calendar found, skipping");
-    return;
-  }
-
-  console.log("[ExCalSync iMIP] Routing", parsed.method, "to", targets.length, "target(s)");
-
-  for (var target of targets) {
-    switch (parsed.method) {
-      case "REQUEST": {
-        var uidMap = await loadMeetingUidMap();
-        var existing = uidMap[parsed.uid];
-        if (existing && parsed.sequence > existing.sequence) {
-          await handleMeetingUpdate(parsed, messageId, target);
-        } else {
-          await handleMeetingRequest(parsed, messageId, target);
-        }
-        break;
-      }
-      case "CANCEL":
-        await handleMeetingCancel(parsed, messageId, target);
-        break;
-      default:
-        console.log("[ExCalSync iMIP] Ignoring method:", parsed.method);
-        break;
-    }
-  }
-}
-
-/**
- * Listen for new incoming emails and scan for meeting invitations.
- */
-browser.messages.onNewMailReceived.addListener(async function (folder, messages) {
-  console.log("[ExCalSync iMIP] New mail received:", messages.messages.length, "messages in", folder.name);
-  var receivingAccountId = folder.accountId || null;
-  for (var msg of messages.messages) {
-    await processMessageForInvites(msg.id, receivingAccountId);
-  }
-});
-
-/**
- * Handle notification clicks — accept pending invitations.
- */
-browser.notifications.onClicked.addListener(async function (notifId) {
-  if (notifId.indexOf("imip-request-") === 0) {
-    await acceptPendingInvite(notifId);
-    await browser.notifications.clear(notifId);
   }
 });
 
@@ -1227,18 +642,19 @@ browser.notifications.onClicked.addListener(async function (notifId) {
       var migrated = {
         id: migratedId,
         email: oldFull.email,
-        authType: oldFull.authType || "basic",
+        // Legacy password authentication is deliberately not migrated.
+        // The user must sign in again with OAuth.
+        authType: "oauth",
         calendarName: oldFull.calendarName || "Exchange Calendar",
         ewsUrl: oldFull.ewsUrl || "",
         syncIntervalMinutes: oldFull.syncIntervalMinutes || DEFAULT_SYNC_INTERVAL_MINUTES,
       };
 
-      // Copy credentials to scoped keys
+      // Copy non-secret credentials/state to scoped keys. OAuth access tokens
+      // remain memory-only; move a legacy refresh token into Login Manager.
       var migrateStore = {};
-      if (oldFull.oauthToken) migrateStore[acctKey(migratedId, "oauthToken")] = oldFull.oauthToken;
-      if (oldFull.oauthRefreshToken) migrateStore[acctKey(migratedId, "oauthRefreshToken")] = oldFull.oauthRefreshToken;
-      if (oldFull.username) migrateStore[acctKey(migratedId, "username")] = oldFull.username;
-      if (oldFull.password) migrateStore[acctKey(migratedId, "password")] = oldFull.password;
+      if (oldFull.oauthToken) oauthTokens[migratedId] = oldFull.oauthToken;
+      if (oldFull.oauthRefreshToken) await setRefreshToken(migratedId, oldFull.oauthRefreshToken);
       if (oldFull.syncState) migrateStore[acctKey(migratedId, "syncState")] = oldFull.syncState;
       if (oldFull.itemMap) migrateStore[acctKey(migratedId, "itemMap")] = oldFull.itemMap;
       if (oldFull.reverseMap) migrateStore[acctKey(migratedId, "reverseMap")] = oldFull.reverseMap;
@@ -1256,6 +672,8 @@ browser.notifications.onClicked.addListener(async function (notifId) {
       ]);
       console.log("[ExCalSync] Migration complete");
     }
+
+    await migrateLegacyOAuthStorage();
 
     var acctList = await loadAccounts();
 
