@@ -1,3 +1,8 @@
+## AI-assisted development
+
+Parts of this project were developed and documented with assistance from AI
+tools.
+
 # Exchange Calendar Sync for Thunderbird
 
 A Thunderbird extension that syncs calendars from Microsoft Exchange to Thunderbird's
